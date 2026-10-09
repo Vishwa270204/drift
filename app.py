@@ -1,415 +1,385 @@
-﻿"""Streamlit dashboard: detect model drift on streaming sensor data and test recovery strategies."""
-from __future__ import annotations
-
-import hashlib
+﻿import copy
+import os
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
+from sklearn.linear_model import SGDRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
 
-from core import data as D
-from core import drift as R
-from core import modeling as M
-from core import plots as P
-from core import simulation as S
-
-st.set_page_config(page_title="Model Drift Dashboard", page_icon=":chart_with_downwards_trend:", layout="wide")
-st.markdown("<style>.block-container{padding-top:2rem;max-width:1250px}</style>", unsafe_allow_html=True)
-
-SAMPLE, UPLOAD = "Sample data (generated)", "Upload CSV files"
-OLD, NEW, BOTH, INCR = "Old data only", "New data only", "Old + New data", "Incremental update"
-STRATEGY_HELP = {
-    OLD: "**Full retrain** - fresh scaler + fresh SGDRegressor on baseline training rows only.",
-    NEW: "**Full retrain** - fresh scaler + fresh SGDRegressor on labeled post-drift adaptation rows only.",
-    BOTH: "**Full retrain** - fresh scaler + fresh SGDRegressor on baseline training rows + post-drift adaptation rows.",
-    INCR: "**Incremental update** - copies the original fitted model, keeps its scaler and calls `partial_fit()` "
-          "on the post-drift adaptation rows. Coefficients are continued, not reset.",
-}
-DEFAULT_PASSES = 5
-
-
-# --------------------------------------------------------------------------- cached loading
-@st.cache_data(show_spinner=False)
-def load_csv(raw: bytes) -> pd.DataFrame:
-    return D.read_csv_bytes(raw)
-
-
-@st.cache_data(show_spinner=False)
-def load_sample():
-    return D.make_sample_data()
-
-
-def df_hash(df: pd.DataFrame) -> bytes:
-    return hashlib.md5(pd.util.hash_pandas_object(df, index=True).to_numpy().tobytes()).digest()
-
-
-def fmt(v, d=3):
-    return "n/a" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:,.{d}f}"
-
-
-# --------------------------------------------------------------------------- sidebar: data
+st.set_page_config(page_title="Model Drift Monitor", layout="wide")
+NONE = "(row order)"
+METRICS = ["MAE", "RMSE", "R²"]
+STRATS = ["New data only", "Old data + new data", "Incremental update"]
 ss = st.session_state
-sb = st.sidebar
-sb.title("Controls")
-sb.subheader("1. Data")
-source = sb.radio("Data source", [SAMPLE, UPLOAD], key="source", label_visibility="collapsed")
-
-if source == SAMPLE:
-    base_raw, cur_raw = load_sample()
-    sb.caption("Synthetic sensor data generated in-app (not your data). Switch to *Upload CSV files* to use your own.")
-else:
-    f_base = sb.file_uploader("Baseline (pre-drift) CSV", type="csv", key="up_base")
-    f_cur = sb.file_uploader("Post-drift CSV", type="csv", key="up_cur")
-    if f_base is None or f_cur is None:
-        st.title("Model Drift Detection & Recovery")
-        st.info("Upload both CSV files in the sidebar (or switch to the generated sample data) to begin.")
-        st.stop()
-    try:
-        base_raw = load_csv(f_base.getvalue())
-    except D.DataError as e:
-        st.error(f"Baseline file: {e}")
-        st.stop()
-    try:
-        cur_raw = load_csv(f_cur.getvalue())
-    except D.DataError as e:
-        st.error(f"Post-drift file: {e}")
-        st.stop()
-
-common = [c for c in base_raw.columns if c in cur_raw.columns]
-col_sig = hashlib.md5(("|".join(base_raw.columns) + "#" + "|".join(cur_raw.columns)).encode()).hexdigest()[:8]
-is_num = lambda s: pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s)
-
-sb.subheader("2. Columns")
-ts_guess = next((c for c in common if any(k in c.lower() for k in ("time", "date"))), "(none)")
-ts_opts = ["(none)"] + common
-ts_sel = sb.selectbox("Timestamp column (optional)", ts_opts, index=ts_opts.index(ts_guess), key=f"ts_{col_sig}")
-ts_col = None if ts_sel == "(none)" else ts_sel
-
-target_opts = [c for c in base_raw.columns if c != ts_col and is_num(base_raw[c])]
-if not target_opts:
-    st.error("The baseline file has no numeric column that can be used as a target.")
-    st.stop()
-target = sb.selectbox("Target column", target_opts, index=len(target_opts) - 1, key=f"tg_{col_sig}_{ts_sel}")
-
-feat_opts = [c for c in common if c not in (ts_col, target)]
-feat_default = [c for c in feat_opts if is_num(base_raw[c]) or base_raw[c].nunique() <= 20]
-features = sb.multiselect("Input feature columns", feat_opts, default=feat_default,
-                          key=f"ft_{col_sig}_{ts_sel}_{target}")
-
-# --------------------------------------------------------------------------- sidebar: thresholds
-sb.subheader("3. Monitoring")
-kind = sb.radio("Rolling error metric", ["MAE", "RMSE"], horizontal=True, key="kind")
-window_in = sb.slider("Rolling window (observations)", 5, 200, 48, key="window")
-factor = sb.slider("Performance threshold (x baseline error)", 1.1, 5.0, 1.5, 0.1, key="factor",
-                   help="Threshold = this multiple of the original model's error on the held-out baseline rows.")
-psi_warn = sb.number_input("PSI warning level", 0.01, 1.0, 0.10, 0.01, key="psi_warn")
-psi_alert = sb.number_input("PSI alert level", 0.02, 2.0, 0.25, 0.01, key="psi_alert")
-eval_pct = sb.slider("Held-out evaluation share of post-drift data (%)", 20, 50, 40, 5, key="eval_pct",
-                     help="The LAST part of the post-drift data is never used for training or adaptation.")
-min_change = sb.slider("Meaningful change in error (%)", 1, 20, 5, key="min_change",
-                       help="MAE and RMSE must both move by at least this much to call it improved / worsened.")
-
-sb.subheader("4. Training strategy")
-sb.radio("Strategy", [OLD, NEW, BOTH, INCR], key="strategy", label_visibility="collapsed")
-sb.caption("Applied when you press **Train / Update Model** in the main page.")
-
-# --------------------------------------------------------------------------- prepare data + original model
-try:
-    prep = D.prepare(base_raw, cur_raw, ts_col, features, target)
-    splits = D.split_data(prep, eval_pct / 100)
-except D.DataError as e:
-    st.title("Model Drift Detection & Recovery")
-    st.error(str(e))
-    st.stop()
-
-X = D.X_COL
-xtitle = "Time" if prep.x_is_time else ("Time (numeric)" if ts_col else "Observation #")
-sig = hashlib.md5(df_hash(base_raw) + df_hash(cur_raw) +
-                  repr((ts_col, features, target, eval_pct)).encode()).hexdigest()
-
-if ss.get("sig") != sig:  # data or column selection changed -> reset everything model-related
-    try:
-        orig0 = M.train_full(splits.base_train, prep.features, prep.num_cols, prep.cat_cols, target,
-                             "Original (baseline training rows)", n_new=0)
-    except M.ModelError as e:
-        st.title("Model Drift Detection & Recovery")
-        st.error(str(e))
-        st.stop()
-    ss.update(sig=sig, orig=orig0, deployed=orig0, result=None, train_error=None, sim=S.new_sim())
-orig: M.ModelBundle = ss["orig"]
-
-# --------------------------------------------------------------------------- core computations
-timeline = pd.concat([splits.base_val, prep.cur], ignore_index=True)  # held-out baseline rows, then all post-drift rows
-pred_tl = M.predict(orig, timeline)
-tx = timeline[X]
-boundary_x = prep.cur[X].iloc[0]
-eval_start_x = splits.cur_eval[X].iloc[0]
-window = int(min(window_in, max(3, len(timeline) // 4)))
-labels = prep.has_labels
-
-if labels:
-    actual_tl = timeline[target].to_numpy(float)
-    err_tl = actual_tl - pred_tl
-    n_val = len(splits.base_val)
-    ref_err = M.regression_metrics(actual_tl[:n_val], pred_tl[:n_val])[kind.lower()]
-    threshold = max(factor * ref_err, 1e-12)
-    roll_tl = R.rolling_error(err_tl, window, kind)
-    drift_i = R.detect_degradation(roll_tl, threshold)
-    drift_x = tx.iloc[drift_i] if drift_i is not None else None
-else:
-    actual_tl = None
-
-eval_df = splits.cur_eval
-pred_eval_orig = M.predict(orig, eval_df)
-m0 = M.regression_metrics(eval_df[target], pred_eval_orig) if labels else None
-result = ss.get("result")
 
 
-# --------------------------------------------------------------------------- training callback
-def run_training():
-    strategy = ss["strategy"]
-    try:
-        if strategy == OLD:
-            b = M.train_full(splits.base_train, prep.features, prep.num_cols, prep.cat_cols, target, strategy, 0)
-        elif strategy == NEW:
-            b = M.train_full(splits.cur_adapt, prep.features, prep.num_cols, prep.cat_cols, target, strategy,
-                             len(splits.cur_adapt))
-        elif strategy == BOTH:
-            both = pd.concat([splits.base_train, splits.cur_adapt], ignore_index=True)
-            b = M.train_full(both, prep.features, prep.num_cols, prep.cat_cols, target, strategy,
-                             len(splits.cur_adapt))
-        else:
-            b = M.incremental_update(ss["orig"], splits.cur_adapt, ss.get("passes", DEFAULT_PASSES), strategy)
-        p = M.predict(b, splits.cur_eval)
-        ss["result"] = {"bundle": b, "pred_eval": p, "strategy": strategy, "passes": ss.get("passes", DEFAULT_PASSES),
-                        "m1": M.regression_metrics(splits.cur_eval[target], p)}
-        ss["train_error"] = None
-    except (M.ModelError, D.DataError) as e:
-        ss["train_error"] = str(e)
+# ---------------------------------------------------------------- helpers
+def score(y, p, m):
+    y, p = np.asarray(y, float), np.asarray(p, float)
+    if len(y) == 0:
+        return np.nan
+    if m == "MAE":
+        return float(mean_absolute_error(y, p))
+    if m == "RMSE":
+        return float(np.sqrt(mean_squared_error(y, p)))
+    return float(r2_score(y, p)) if len(y) > 1 and np.var(y) > 0 else np.nan
 
 
-# --------------------------------------------------------------------------- header
-st.title("Model Drift Detection & Recovery")
-if source == SAMPLE:
-    st.info("Showing **generated sample data** (synthetic hourly sensor readings with built-in drift), not your data.", icon=":material/science:")
-if prep.notes:
-    with st.expander(f"Data notes ({len(prep.notes)})"):
-        for n in prep.notes:
-            st.write("- " + n)
-st.caption(
-    f"Original model: SGDRegressor trained on the first {len(splits.base_train)} baseline rows "
-    f"({len(splits.base_val)} baseline rows held out). Post-drift data: {len(splits.cur_adapt)} adaptation rows "
-    f"+ {len(splits.cur_eval)} held-out evaluation rows (chronological split)."
-)
-
-# --------------------------------------------------------------------------- 1. KPI cards
-def kpi_row(title, m, n_train, n_new, ref=None):
-    st.markdown(f"**{title}**")
-    c = st.columns(5)
-    for col, key, label in ((c[0], "mae", "MAE"), (c[1], "rmse", "RMSE")):
-        delta = None if ref is None else f"{m[key] - ref[key]:+.3f}"
-        col.metric(label, fmt(m[key]), delta, delta_color="inverse")
-    r2 = m["r2"]
-    delta = None if ref is None or r2 is None or ref["r2"] is None else f"{r2 - ref['r2']:+.3f}"
-    c[2].metric("R²", fmt(r2), delta)
-    c[3].metric("Training observations", f"{n_train:,}")
-    c[4].metric("New observations used", f"{n_new:,}")
+def roll_metric(y, p, w, m):
+    e = pd.Series(np.asarray(y, float) - np.asarray(p, float))
+    if m == "MAE":
+        return e.abs().rolling(w).mean().values
+    if m == "RMSE":
+        return np.sqrt((e ** 2).rolling(w).mean()).values
+    var = pd.Series(np.asarray(y, float)).rolling(w).var(ddof=0).replace(0, np.nan)
+    return (1 - (e ** 2).rolling(w).mean() / var).values
 
 
-if labels:
-    st.caption(f"KPIs are computed on the same held-out evaluation segment (n = {m0['n']}). Deltas compare the updated model with the original.")
-    kpi_row("Original model", m0, orig.n_train, 0)
-    if result:
-        kpi_row(f"Updated model - {result['strategy']}", result["m1"], result["bundle"].n_train,
-                result["bundle"].n_new, ref=m0)
+def threshold(ref, t, m):
+    return ref - t * max(abs(ref), 1e-9) if m == "R²" else ref * (1 + t)
+
+
+def is_degraded(val, ref, t, m):
+    return val < threshold(ref, t, m) if m == "R²" else val > threshold(ref, t, m)
+
+
+def improvement(cand, base, m):  # positive = better
+    if m == "R²":
+        return (cand - base) / max(abs(base), 1e-9)
+    return (base - cand) / max(abs(base), 1e-9)
+
+
+def psi(b, c):
+    b, c = b.dropna(), c.dropna()
+    if len(b) == 0 or len(c) == 0:
+        return np.nan
+    if pd.api.types.is_numeric_dtype(b):
+        cuts = np.unique(np.quantile(b, np.linspace(0.1, 0.9, 9)))
+        pb = np.bincount(np.searchsorted(cuts, b.values, side="right"), minlength=len(cuts) + 1) / len(b)
+        pc = np.bincount(np.searchsorted(cuts, c.values, side="right"), minlength=len(cuts) + 1) / len(c)
     else:
-        st.caption("Train / update a model in the *Retraining comparison* section to see the updated model here.")
-else:
-    st.warning("Actual target values are unavailable for the post-drift data, so MAE / RMSE / R² are not computed "
-               "and model accuracy is unknown. Only predictions and feature drift (PSI) are shown.")
-
-# --------------------------------------------------------------------------- 2. actual vs predicted
-st.subheader("Actual vs predicted")
-st.plotly_chart(P.fig_actual_vs_pred(
-    tx, actual_tl if labels else None, pred_tl, boundary_x, eval_start_x, xtitle, target,
-    x_eval=eval_df[X] if result else None, pred_upd=result["pred_eval"] if result else None), width="stretch")
-
-# --------------------------------------------------------------------------- 3. degradation
-st.subheader("Model degradation")
-with st.expander("What does each signal monitor?"):
-    st.markdown(
-        "- **Rolling MAE/RMSE vs threshold** - *predictive performance*. Needs actual target values.\n"
-        "- **PSI** - *input feature distribution* shift vs the baseline. Needs no labels, and a shifted feature "
-        "does not by itself mean the model got worse.\n"
-        "- **ADWIN** (change detection on an error stream) is *not* included in this demo."
-    )
-if labels:
-    if drift_i is None:
-        st.success(f"No degradation detected: rolling {kind} stayed at or below the threshold {threshold:.3g} "
-                   f"(= {factor:.1f} x baseline hold-out {kind} {ref_err:.3g}).")
-    else:
-        st.warning(f"Degradation detected: rolling {kind} first exceeded the threshold {threshold:.3g} "
-                   f"(= {factor:.1f} x baseline hold-out {kind} {ref_err:.3g}) at {tx.iloc[drift_i]} "
-                   f"(observation {drift_i + 1} of {len(tx)} in the monitored timeline).", icon=":material/warning:")
-    if window < window_in:
-        st.caption(f"Window reduced to {window} because the timeline is short.")
-    st.plotly_chart(P.fig_rolling(tx, roll_tl, threshold, boundary_x, drift_x, kind, window, xtitle), width="stretch")
-    st.plotly_chart(P.fig_abs_error(tx, np.abs(err_tl), drift_x, boundary_x, xtitle), width="stretch")
-else:
-    st.info("Performance monitoring needs actual target values for the post-drift period.")
-
-# --------------------------------------------------------------------------- 4. feature drift
-st.subheader("Feature drift")
-psi_df = R.compute_psi(prep.base, prep.cur, prep.features, prep.num_cols, psi_warn, psi_alert)
-feat_sel = st.selectbox("Feature", prep.features, index=prep.features.index(psi_df["feature"].iloc[0]),
-                        key=f"fsel_{sig}")
-row = psi_df.loc[psi_df.feature == feat_sel].iloc[0]
-c1, c2 = st.columns([1, 3])
-with c1:
-    st.metric("PSI (baseline vs post-drift)", fmt(row["psi"]))
-    msg = f"{row['status']} (warn >= {psi_warn:.2f}, alert >= {psi_alert:.2f})"
-    (st.error if row["status"] == "significant shift" else st.warning if row["status"] == "moderate shift" else st.success)(msg)
-    st.caption("Feature drift does not necessarily mean predictive performance has degraded - check the error charts above.")
-with c2:
-    st.plotly_chart(P.fig_feature(prep.base[feat_sel], prep.cur[feat_sel], feat_sel in prep.num_cols, feat_sel),
-                    width="stretch")
-with st.expander("PSI for all features"):
-    st.dataframe(psi_df.assign(psi=psi_df["psi"].round(4)), hide_index=True, width="stretch")
-
-# --------------------------------------------------------------------------- 5. retraining comparison
-st.subheader("Retraining comparison")
-strategy = ss["strategy"]
-st.markdown(STRATEGY_HELP[strategy])
-if strategy == INCR:
-    st.number_input("Passes over the new data (partial_fit calls)", 1, 50, DEFAULT_PASSES, key="passes")
-    st.caption(f"Will use {len(splits.cur_adapt)} new labeled observations.")
-elif strategy in (NEW, BOTH):
-    st.caption(f"Will use {len(splits.cur_adapt)} post-drift labeled observations"
-               + (f" + {len(splits.base_train)} baseline rows." if strategy == BOTH else "."))
-else:
-    st.caption(f"Will use {len(splits.base_train)} baseline rows (no post-drift data).")
-
-st.button("Train / Update Model", type="primary", on_click=run_training, disabled=not labels,
-          help=None if labels else "Needs actual target values in the post-drift data.")
-if ss.get("train_error"):
-    st.error(ss["train_error"])
-
-if labels and result:
-    m1 = result["m1"]
-    tol = min_change / 100
-
-    def rel(a, b):
-        return 0.0 if a == b else (b - a) / a if a > 0 else np.inf
-
-    dm, dr = rel(m0["mae"], m1["mae"]), rel(m0["rmse"], m1["rmse"])
-    if dm <= -tol and dr <= -tol:
-        st.success(f"**Performance improved** on held-out post-drift data (MAE {dm:+.1%}, RMSE {dr:+.1%}).")
-    elif dm >= tol and dr >= tol:
-        st.error(f"**Performance worsened** on held-out post-drift data (MAE {dm:+.1%}, RMSE {dr:+.1%}).")
-    else:
-        st.info(f"**No meaningful improvement** (MAE {dm:+.1%}, RMSE {dr:+.1%}; threshold +/-{min_change}% on both).")
-
-    rows = []
-    for name, k in (("MAE", "mae"), ("RMSE", "rmse"), ("R²", "r2")):
-        a, b = m0[k], m1[k]
-        both = a is not None and b is not None
-        rows.append({"Metric": name, "Original": fmt(a, 4), "Updated": fmt(b, 4),
-                     "Difference (updated - original)": f"{b - a:+.4f}" if both else "n/a",
-                     "Change %": f"{(b - a) / abs(a):+.1%}" if both and name != "R²" and a else "-"})
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    st.caption("Lower MAE / RMSE and higher R² are better. Evaluated on the held-out final post-drift rows that "
-               "neither model saw during training or adaptation.")
-
-    xe = eval_df[X]
-    actual_e = eval_df[target].to_numpy(float)
-    w_eval = int(min(window, max(3, len(eval_df) // 3)))
-    r0 = R.rolling_error(actual_e - pred_eval_orig, w_eval, kind)
-    r1 = R.rolling_error(actual_e - result["pred_eval"], w_eval, kind)
-    cc1, cc2 = st.columns(2)
-    cc1.plotly_chart(P.fig_compare_pred(xe, actual_e, pred_eval_orig, result["pred_eval"], xtitle, target), width="stretch")
-    cc2.plotly_chart(P.fig_compare_rolling(xe, r0, r1, kind, w_eval, xtitle), width="stretch")
-
-    b1, b2 = st.columns([1, 3])
-    if b1.button("Deploy this model to the simulation"):
-        ss["deployed"] = result["bundle"]
-        ss["sim"] = S.new_sim()
-        st.toast("Deployed. Simulation was reset.")
-    b2.caption(f"Currently deployed in the simulation: **{ss['deployed'].strategy}**")
-
-# --------------------------------------------------------------------------- 6. live simulation
-st.subheader("Live-data simulation (optional)")
-st.caption("Replays the post-drift CSV in chronological batches. Predictions use features only; each actual value becomes "
-           "'known' only after the label delay. The model is never updated automatically.")
-sim = ss["sim"]
-n_cur = len(prep.cur)
-k1, k2, k3, k4 = st.columns([1, 1, 1, 1])
-batch = k3.number_input("Batch size", 1, 200, 10, key="sim_batch")
-delay = k4.number_input("Label delay (observations)", 0, 500, 20, key="sim_delay",
-                        disabled=not labels, help="Observation i's actual value is available once i + delay observations have been processed.")
-if not labels:
-    delay = 0
-done = sim["pos"] >= n_cur
-if k1.button("Pause" if sim["running"] else "Start", type="primary", disabled=done and not sim["running"]):
-    sim["running"] = not sim["running"]
-    st.rerun()
-if k2.button("Reset simulation"):
-    ss["sim"] = S.new_sim()
-    st.rerun()
-
-u1, u2 = st.columns([1, 3])
-n_avail = S.labeled_count(sim, delay)
-if u1.button("Update deployed model", disabled=not labels or n_avail - sim["last_update"] < 1,
-             help="partial_fit on labeled observations received since the last update."):
-    try:
-        new_obs = prep.cur.iloc[sim["last_update"]:n_avail]
-        ss["deployed"] = M.incremental_update(ss["deployed"], new_obs, ss.get("passes", DEFAULT_PASSES),
-                                              "Incremental update (simulation)")
-        sim["last_update"] = n_avail
-        sim["update_marks"].append(prep.cur[X].iloc[n_avail - 1])
-        st.toast(f"Deployed model updated with {len(new_obs)} labeled observations.")
-    except M.ModelError as e:
-        st.warning(str(e))
-u2.caption(f"Deployed model: **{ss['deployed'].strategy}** - {ss['deployed'].n_new} post-drift labeled observations "
-           f"used so far. Observations awaiting an update: {max(0, n_avail - sim['last_update'])}.")
+        b, c = b.astype(str), c.astype(str)
+        cats = sorted(set(b) | set(c))
+        pb = b.value_counts(normalize=True).reindex(cats, fill_value=0).values
+        pc = c.value_counts(normalize=True).reindex(cats, fill_value=0).values
+    pb, pc = np.clip(pb, 1e-4, None), np.clip(pc, 1e-4, None)
+    return float(np.sum((pc - pb) * np.log(pc / pb)))
 
 
-def sim_body():
-    sm = ss["sim"]
-    if sm["running"]:
-        S.step(sm, ss["deployed"], prep.cur, batch)
-        if not sm["running"]:
-            st.rerun()  # finished: stop the timer
-    if sm["pos"] == 0:
-        st.info("Press **Start** to begin streaming.")
+def raw_features(df, p):
+    X = (df[p["num"]].apply(pd.to_numeric, errors="coerce")
+         .replace([np.inf, -np.inf], np.nan).fillna(p["med"]))
+    if p["cat"]:
+        cat = df[p["cat"]].astype(object).fillna("__na__").astype(str)
+        D = pd.get_dummies(cat, dtype=float).reindex(columns=p["dcols"], fill_value=0.0)
+        X = pd.concat([X, D], axis=1)
+    return X
+
+
+def make_X(df):  # scaler is fitted once on the baseline training rows and never refitted
+    p = ss.S["p"]
+    return p["sc"].transform(raw_features(df, p).values)
+
+
+def predict(model, df):
+    p = ss.S["p"]
+    return model.predict(make_X(df)) * p["ys"] + p["ym"]
+
+
+def scaled_y(y):
+    p = ss.S["p"]
+    return (np.asarray(y, float) - p["ym"]) / p["ys"]
+
+
+def shade(fig, x0, x1, color, row=None):
+    kw = dict(row=row, col=1) if row else {}
+    fig.add_vrect(x0=x0, x1=x1, fillcolor=color, opacity=0.12, line_width=0, layer="below", **kw)
+
+
+# ---------------------------------------------------------------- baseline
+def init_baseline(df, target, feats, tcol, frac, lag):
+    d = df.copy()
+    if tcol != NONE:
+        d[tcol] = pd.to_datetime(d[tcol], errors="coerce")
+        d = d.dropna(subset=[tcol]).sort_values(tcol, kind="stable")
+    d[target] = pd.to_numeric(d[target], errors="coerce")
+    n_bad = int(d[target].isna().sum())
+    d = d.dropna(subset=[target]).reset_index(drop=True)  # labels are never invented
+    if n_bad:
+        st.warning(f"Dropped {n_bad} rows with a missing/non-numeric target.")
+    d["_x"] = d[tcol] if tcol != NONE else np.arange(len(d))
+    feats = list(feats)
+    if lag:  # previous actual: known at prediction time (one-step-ahead)
+        d["_lag1"] = d[target].shift(1)
+        feats.append("_lag1")
+        d = d.iloc[1:].reset_index(drop=True)
+    n = len(d)
+    n_tr = int(n * frac)
+    if n_tr < 30 or n - n_tr < 30:
+        st.error(f"Not enough rows for a reliable split (total {n}, train {n_tr}, stream {n - n_tr}). Need ≥30 each.")
         return
-    v = S.view(sm, prep.cur, target, delay, labels)
-    lab = v[v.label_available]
-    m = st.columns(4)
-    m[0].metric("Processed", f"{sm['pos']} / {n_cur}")
-    m[1].metric("Labels received", len(lab))
-    m[2].metric("Awaiting label", sm["pos"] - len(lab))
-    roll = None
-    if len(lab):
-        mp = min(window, max(3, window // 4))
-        roll = R.rolling_error(lab["actual"] - lab["prediction"], window, kind, min_periods=mp)
-        last = roll.dropna()
-        m[3].metric(f"Rolling {kind}", fmt(last.iloc[-1]) if len(last) else "n/a")
-    else:
-        m[3].metric(f"Rolling {kind}", "n/a")
-    g1, g2 = st.columns(2)
-    g1.plotly_chart(P.fig_sim_stream(v, xtitle, target), width="stretch")
-    if roll is not None and roll.notna().any():
-        g2.plotly_chart(P.fig_sim_rolling(lab["x"], roll, threshold, kind, sm["update_marks"], xtitle), width="stretch")
-    else:
-        g2.info("Performance chart appears once enough labels have arrived.")
-    shown = v.tail(8).copy()
-    shown["actual"] = shown["actual"].where(shown["label_available"]).map(lambda a: "pending" if pd.isna(a) else f"{a:.3f}")
-    shown["prediction"] = shown["prediction"].round(3)
-    st.dataframe(shown[["obs", "x", "prediction", "actual"]].iloc[::-1], hide_index=True, width="stretch")
-    st.download_button("Download stored observations + predictions (CSV)",
-                       pd.concat([prep.cur[prep.features].iloc[:sm["pos"]].reset_index(drop=True),
-                                  v[["prediction", "actual"]]], axis=1).to_csv(index=False),
-                       "simulation_log.csv", "text/csv")
+    fit_n = int(n_tr * 0.85)  # last 15% of training = baseline reference (not fitted on)
+    fit = d.iloc[:fit_n]
+    num = [c for c in feats if pd.api.types.is_numeric_dtype(d[c])]
+    cat = [c for c in feats if c not in num]
+    wide = [c for c in cat if d[c].nunique() > 30]
+    if wide:
+        st.warning(f"Skipped high-cardinality columns: {wide}")
+    cat = [c for c in cat if c not in wide]
+    if not num and not cat:
+        st.error("No usable feature columns.")
+        return
+    p = dict(num=num, cat=cat, med=fit[num].apply(pd.to_numeric, errors="coerce").median().fillna(0))
+    p["dcols"] = list(pd.get_dummies(fit[cat].astype(object).fillna("__na__").astype(str), dtype=float).columns) if cat else []
+    p["ym"], p["ys"] = float(fit[target].mean()), float(fit[target].std() or 1.0)
+    p["sc"] = StandardScaler().fit(raw_features(fit, p).values)
+    ss.S = dict(d=d, feats=num + cat, target=target, n_tr=n_tr, fit_n=fit_n, p=p)
+    model = SGDRegressor(random_state=0).fit(make_X(fit), scaled_y(fit[target]))
+    ss.S["model"] = model
+    ss.S["pred"] = predict(model, d)  # features only; no stream labels are used
+    ss.pos, ss.cands, ss.split_key, ss.drift = 0, {}, None, None
+    ss.active, ss.amodel = "Original model", None
 
 
-st.fragment(run_every=0.7 if sim["running"] else None)(sim_body)()
+# ---------------------------------------------------------------- sidebar
+sb = st.sidebar
+sb.header("Controls")
+up = sb.file_uploader("CSV file", type="csv")
+path = sb.text_input("…or path to existing CSV", "")
+raw = None
+if up is not None:
+    raw = pd.read_csv(up)
+elif path and os.path.exists(path):
+    raw = pd.read_csv(path)
+elif path:
+    sb.error("Path not found.")
+
+st.title("Model Drift, Performance Monitoring & Retraining")
+st.caption("CSV-based live-stream simulation — rows are replayed in order; this is not a real-time production stream.")
+
+if raw is None:
+    st.info("Upload a CSV (or enter its path) in the sidebar.")
+    st.stop()
+
+with st.expander("Dataset inspection", expanded=False):
+    st.write(f"{raw.shape[0]} rows × {raw.shape[1]} columns")
+    st.dataframe(pd.DataFrame({"dtype": raw.dtypes.astype(str), "missing": raw.isna().sum(),
+                               "unique": raw.nunique()}))
+    st.dataframe(raw.head())
+
+cols = list(raw.columns)
+num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(raw[c])]
+if not num_cols:
+    st.error("No numeric column found, so there is no suitable regression target.")
+    st.stop()
+target = sb.selectbox("Target column", num_cols, index=len(num_cols) - 1)
+tcol = sb.selectbox("Timestamp column", [NONE] + cols)
+feats = sb.multiselect("Feature columns", [c for c in cols if c not in (target, tcol)],
+                       default=[c for c in num_cols if c != target and c != tcol])
+lag = sb.checkbox("Add previous target (lag-1) as feature", value=False)
+frac = sb.slider("Initial training proportion", 0.3, 0.9, 0.7, 0.05)
+metric = sb.selectbox("Performance metric", METRICS)
+win = sb.number_input("Rolling window (rows)", 5, 1000, 30)
+thr_pct = sb.slider("Degradation threshold (% worse than baseline)", 5, 200, 30) / 100
+delay = sb.number_input("Label delay (rows)", 0, 500, 0, help="Actuals arrive this many rows after the prediction.")
+if sb.button("Initialize / train baseline", type="primary"):
+    if not feats and not lag:
+        sb.error("Select at least one feature.")
+    else:
+        init_baseline(raw, target, feats, tcol, frac, lag)
+
+if "S" not in ss:
+    st.info("Configure the sidebar and click **Initialize / train baseline**.")
+    st.stop()
+
+S = ss.S
+d, n_tr, fit_n, tgt = S["d"], S["n_tr"], S["fit_n"], S["target"]
+n_stream = len(d) - n_tr
+y_all, p_all, xs = d[tgt].values, S["pred"], d["_x"]
+
+# ---------------------------------------------------------------- stream controls
+c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+batch = c1.number_input("Batch size", 1, max(n_stream, 1), min(50, n_stream))
+if c2.button("Process next batch"):
+    ss.pos = min(ss.pos + batch, n_stream)
+if c3.button("Process all"):
+    ss.pos = n_stream
+if c4.button("Reset stream"):
+    ss.pos, ss.cands, ss.split_key, ss.drift = 0, {}, None, None
+k = ss.pos
+st.progress(k / n_stream, text=f"Processed {k} / {n_stream} stream rows · active model: {ss.active}")
+if k == 0:
+    st.info("Process a batch to start the simulation.")
+    st.stop()
+
+# ---------------------------------------------------------------- monitoring
+lab = max(k - delay, 0)  # rows whose actuals have arrived
+ref = score(y_all[fit_n:n_tr], p_all[fit_n:n_tr], metric)
+roll = roll_metric(y_all[n_tr:n_tr + lab], p_all[n_tr:n_tr + lab], win, metric)
+bad = np.where(~np.isnan(roll) & is_degraded(roll, ref, thr_pct, metric))[0] if lab >= win else []
+d_rel = int(bad[0]) if len(bad) else None
+ss.drift = d_rel
+onset = max(d_rel - win + 1, 0) if d_rel is not None else None
+x_stream = xs.iloc[n_tr:n_tr + k]
+
+if delay and k - lab:
+    st.caption(f"⏳ {k - lab} most recent rows are pending labels (delay = {delay}); metrics use labeled rows only.")
+if lab < win:
+    st.warning(f"Performance metric pending: need {win} labeled rows (have {lab}).")
+elif d_rel is None:
+    st.success(f"No performance degradation detected so far (reference {metric} = {ref:.4g}).")
+else:
+    st.error(f"Performance degradation detected at stream row {d_rel + delay} "
+             f"(approx. onset: row {onset}). Data drift alone does not confirm concept drift.")
+
+# Graph 1
+st.subheader("1 · Actual vs Predicted")
+n_show = n_tr + k
+g1 = go.Figure()
+g1.add_scatter(x=xs[:n_show], y=y_all[:n_show], name="Actual", line=dict(color="#444", width=1))
+g1.add_scatter(x=xs[:n_show], y=p_all[:n_show], name="Original model", line=dict(color="#1f77b4", width=1))
+if ss.amodel is not None:
+    g1.add_scatter(x=x_stream, y=predict(ss.amodel, d.iloc[n_tr:n_tr + k]), name=f"Active: {ss.active}",
+                   line=dict(color="#2ca02c", width=1))
+shade(g1, xs.iloc[0], xs.iloc[n_tr - 1], "#1f77b4")
+if d_rel is not None:
+    shade(g1, xs.iloc[n_tr + onset], xs.iloc[n_show - 1], "#d62728")
+    g1.add_scatter(x=[xs.iloc[n_tr + d_rel]], y=[y_all[n_tr + d_rel]], mode="markers", name="Degradation detected",
+                   marker=dict(color="red", size=11, symbol="x"))
+g1.update_layout(height=380, margin=dict(t=20), legend=dict(orientation="h"),
+                 xaxis_title="Time / index", yaxis_title=tgt)
+st.plotly_chart(g1, width="stretch")
+st.caption("Blue shading: baseline training period · Red shading: post-drift period (from approximate onset).")
+
+# Graph 2
+st.subheader("2 · Model Performance / Degradation")
+g2 = go.Figure()
+if metric != "R²":
+    g2.add_scatter(x=x_stream.iloc[:lab], y=np.abs(y_all[n_tr:n_tr + lab] - p_all[n_tr:n_tr + lab]),
+                   name="Absolute error", line=dict(color="#bbb", width=1))
+g2.add_scatter(x=x_stream.iloc[:lab], y=roll, name=f"Rolling {metric}", line=dict(color="#1f77b4"))
+g2.add_hline(y=threshold(ref, thr_pct, metric), line_dash="dash", line_color="red", annotation_text="Threshold")
+g2.add_hline(y=ref, line_dash="dot", line_color="green", annotation_text="Baseline reference")
+if lab:
+    shade(g2, x_stream.iloc[0], x_stream.iloc[(onset if d_rel is not None else lab - 1)], "#2ca02c")
+if d_rel is not None:
+    shade(g2, x_stream.iloc[onset], x_stream.iloc[lab - 1], "#d62728")
+    g2.add_scatter(x=[x_stream.iloc[d_rel]], y=[roll[d_rel]], mode="markers", name="Degradation detected",
+                   marker=dict(color="red", size=12, symbol="x"))
+g2.update_layout(height=340, margin=dict(t=20), legend=dict(orientation="h"), xaxis_title="Time / index",
+                 yaxis_title=metric)
+st.plotly_chart(g2, width="stretch")
+st.caption("Green: pre-drift · Red: post-drift. The baseline reference uses the last 15% of the training segment, which the model was not fitted on.")
+
+# Graph 3
+st.subheader("3 · Data Drift (PSI)")
+pc1, pc2, pc3 = st.columns(3)
+base_n = pc1.slider("Baseline window (first N training rows)", 20, n_tr, min(n_tr, 200))
+cur_n = pc2.slider("Current window (latest N processed rows)", 10, max(k, 11), min(max(k, 11), 100))
+psi_t = pc3.slider("PSI threshold", 0.05, 0.5, 0.2, 0.05)
+bw, cw = d.iloc[:base_n], d.iloc[n_tr + max(k - cur_n, 0):n_tr + k]
+ps = pd.Series({f: psi(bw[f], cw[f]) for f in S["feats"]})
+g3 = go.Figure(go.Bar(x=ps.index, y=ps.values, marker_color=["#d62728" if v > psi_t else "#1f77b4" for v in ps.fillna(0)]))
+g3.add_hline(y=psi_t, line_dash="dash", line_color="red")
+g3.update_layout(height=320, margin=dict(t=20), yaxis_title="PSI")
+st.plotly_chart(g3, width="stretch")
+over = ps[ps > psi_t].index.tolist()
+st.caption(f"Features above threshold: {over if over else 'none'}. PSI flags input distribution change only; it does not prove concept drift.")
+
+# ---------------------------------------------------------------- retraining
+st.header("Model Update / Retraining")
+if d_rel is None:
+    st.info("Available once performance degradation is detected.")
+    st.stop()
+
+ev_frac = st.slider("Held-out evaluation share of post-drift labeled rows", 0.2, 0.5, 0.3, 0.05)
+gap = st.number_input("Purge gap between training and evaluation rows", 0, 100, 1 if lag else 0,
+                      help="Rows skipped so overlapping windows/lag features can't leak into evaluation.")
+m_pool = lab - onset
+n_ev = int(m_pool * ev_frac)
+tr_end, ev_s = onset + m_pool - n_ev - gap, onset + m_pool - n_ev  # stream-relative
+if tr_end - onset < 10 or n_ev < 10:
+    st.warning(f"Not enough labeled post-drift rows yet (pool {m_pool}). Process more data.")
+    st.stop()
+key = (onset, tr_end, ev_s, lab)
+if ss.split_key != key:
+    if ss.cands:
+        st.warning("Evaluation split changed with new data — previous candidates cleared; retrain them.")
+    ss.cands, ss.split_key = {}, key
+pool_n = tr_end - onset
+ev = d.iloc[n_tr + ev_s:n_tr + lab]
+st.caption(f"Post-drift labeled pool: {pool_n} training rows (stream {onset}–{tr_end - 1}) · "
+           f"{n_ev} held-out evaluation rows (stream {ev_s}–{lab - 1}) · scaler/target scaling stay fixed from the baseline.")
+
+tabs = st.tabs(STRATS)
+for strat, tab in zip(STRATS, tabs):
+    with tab:
+        n_new = st.slider(f"New rows to use ({strat})", min(10, pool_n), pool_n, pool_n)
+        epochs = st.slider(f"Passes ({strat})", 1, 20, 3) if strat == "Incremental update" else 1
+        new = d.iloc[n_tr + tr_end - n_new:n_tr + tr_end]  # most recent labeled rows before the gap
+        n_rows = n_new + (n_tr if strat == "Old data + new data" else 0)
+        st.write(f"Training rows: **{n_rows}**")
+        if st.button("Run update", key=f"run_{strat}"):
+            if strat == "Incremental update":
+                m = copy.deepcopy(S["model"])
+                Xn, yn = make_X(new), scaled_y(new[tgt])
+                for _ in range(epochs):
+                    m.partial_fit(Xn, yn)
+            else:
+                tr = pd.concat([d.iloc[:n_tr], new]) if strat == "Old data + new data" else new
+                m = SGDRegressor(random_state=0).fit(make_X(tr), scaled_y(tr[tgt]))
+            ss.cands[strat] = dict(model=m, rows=n_rows)
+
+# ---------------------------------------------------------------- evaluation
+st.subheader("Evaluation on held-out post-drift rows")
+y_ev = ev[tgt].values
+p_base = p_all[n_tr + ev_s:n_tr + lab]
+rows = [dict(Model="Original model", Rows=fit_n, **{m: score(y_ev, p_base, m) for m in METRICS}, Change="—", Accept="—")]
+preds = {}
+accepted = {}
+min_gain = st.slider("Acceptance: minimum improvement on selected metric (%)", 0, 50, 5) / 100
+b_val = score(y_ev, p_base, metric)
+for s, c in ss.cands.items():
+    preds[s] = predict(c["model"], ev)
+    vals = {m: score(y_ev, preds[s], m) for m in METRICS}
+    gain = improvement(vals[metric], b_val, metric)
+    accepted[s] = bool(gain >= min_gain)
+    rows.append(dict(Model=s, Rows=c["rows"], **vals, Change=f"{gain * 100:+.1f}%",
+                     Accept="✅" if accepted[s] else "❌"))
+if not ss.cands:
+    st.info("Run at least one update to compare against the original model.")
+else:
+    st.dataframe(pd.DataFrame(rows).style.format({m: "{:.4g}" for m in METRICS}), width="stretch", hide_index=True)
+    st.caption(f"Change = improvement ({metric}) vs the original model; positive is better.")
+
+    st.subheader("4 · Model Performance Comparison")
+    names = ["Original (before)"] + [f"{s} (after)" for s in ss.cands]
+    g4 = go.Figure(go.Bar(x=names, y=[b_val] + [r[metric] for r in rows[1:]],
+                          marker_color=["#888"] + ["#2ca02c" if accepted[s] else "#d62728" for s in ss.cands]))
+    g4.update_layout(height=320, margin=dict(t=20), yaxis_title=metric)
+    st.plotly_chart(g4, width="stretch")
+
+    fe = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.06,
+                       subplot_titles=("Predictions", "Absolute error"))
+    fe.add_scatter(x=ev["_x"], y=y_ev, name="Actual", line=dict(color="#444"), row=1, col=1)
+    fe.add_scatter(x=ev["_x"], y=p_base, name="Original", line=dict(color="#1f77b4"), row=1, col=1)
+    fe.add_scatter(x=ev["_x"], y=np.abs(y_ev - p_base), name="Original", line=dict(color="#1f77b4"),
+                   showlegend=False, row=2, col=1)
+    for s, pr in preds.items():
+        fe.add_scatter(x=ev["_x"], y=pr, name=s, row=1, col=1)
+        fe.add_scatter(x=ev["_x"], y=np.abs(y_ev - pr), name=s, showlegend=False, row=2, col=1)
+    fe.update_layout(height=450, margin=dict(t=30), legend=dict(orientation="h"))
+    st.plotly_chart(fe, width="stretch")
+
+    st.subheader("Promote")
+    pick = st.selectbox("Candidate", list(ss.cands))
+    if not accepted[pick]:
+        st.warning("Candidate does not meet the acceptance criterion — the original model stays active.")
+    if st.button("Promote Candidate Model", disabled=not accepted[pick]):
+        ss.active, ss.amodel = pick, copy.deepcopy(ss.cands[pick]["model"])
+        st.success(f"Promoted: {pick}. It is now shown as the active model in Graph 1.")
+        st.rerun()
