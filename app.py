@@ -1,63 +1,110 @@
-﻿import copy
+import copy
+import glob
+import io
 import os
+import warnings
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from plotly.subplots import make_subplots
 from sklearn.linear_model import SGDRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import StandardScaler
 
 st.set_page_config(page_title="Model Drift Monitor", layout="wide")
-NONE = "(row order)"
-METRICS = ["MAE", "RMSE", "R²"]
-STRATS = ["New data only", "Old data + new data", "Incremental update"]
 ss = st.session_state
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# ---- sensible defaults (no manual settings) ----
+TRAIN_FRAC = 0.70      # first 70% of rows = initial training data
+DEGRADE_PCT = 0.30     # degraded when recent error is 30% above baseline error
+PSI_LIMIT = 0.20       # common rule of thumb for a significant input shift
+EVAL_FRAC = 0.30       # share of recent labeled rows kept unseen for evaluation
+MIN_GAIN = 0.05        # updated model must cut MAE by at least 5% (and not worsen RMSE)
+OPTIONS = ["Use New Data Only", "Use Old + New Data", "Update Existing Model"]
+TARGET_WORDS = ["target", "label", "y", "output", "response", "price", "sales", "demand", "value",
+                "load", "close", "revenue", "count", "temperature", "consumption", "energy", "power", "amount"]
 
 
-# ---------------------------------------------------------------- helpers
+# ---------------------------------------------------------------- loading & auto-detection
+@st.cache_data
+def read_path(path, mtime):
+    return pd.read_csv(path)
+
+
+@st.cache_data
+def read_bytes(b):
+    return pd.read_csv(io.BytesIO(b))
+
+
+def to_dt(s):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            return pd.to_datetime(s, errors="coerce", format="mixed")
+        except (TypeError, ValueError):
+            return pd.to_datetime(s, errors="coerce")
+
+
+def is_num(s):
+    return pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s)
+
+
+def find_time(df):
+    for c in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[c]):
+            return c
+    for c in df.columns:
+        if is_num(df[c]) or pd.api.types.is_bool_dtype(df[c]):
+            continue
+        smp = df[c].dropna().head(200)
+        if len(smp) and to_dt(smp).notna().mean() >= 0.9:
+            return c
+    return None
+
+
+def find_target(df, tcol):
+    nums = [c for c in df.columns if c != tcol and is_num(df[c]) and df[c].nunique() > 5]
+    low = {c: c.lower().strip() for c in nums}
+    exact = [c for c in nums if low[c] in TARGET_WORDS]
+    if len(exact) == 1:
+        return exact[0], nums
+    part = [c for c in nums if any(w in low[c] for w in TARGET_WORDS if len(w) > 3)]
+    if not exact and len(part) == 1:
+        return part[0], nums
+    return None, nums  # not confident -> ask
+
+
+def pick_features(df, target, tcol):
+    out = []
+    for c in df.columns:
+        s = df[c]
+        if c in (target, tcol) or s.isna().mean() > 0.5 or s.nunique() <= 1:
+            continue
+        if c.lower() in ("id", "index") or c.lower().endswith("_id"):
+            continue
+        if not is_num(s) and s.nunique() > 30:
+            continue
+        if s.nunique() == len(s) and not pd.api.types.is_float_dtype(s):
+            continue  # looks like an ID / row counter
+        out.append(c)
+    return out
+
+
+# ---------------------------------------------------------------- model helpers
 def score(y, p, m):
     y, p = np.asarray(y, float), np.asarray(p, float)
     if len(y) == 0:
         return np.nan
-    if m == "MAE":
-        return float(mean_absolute_error(y, p))
-    if m == "RMSE":
-        return float(np.sqrt(mean_squared_error(y, p)))
-    return float(r2_score(y, p)) if len(y) > 1 and np.var(y) > 0 else np.nan
-
-
-def roll_metric(y, p, w, m):
-    e = pd.Series(np.asarray(y, float) - np.asarray(p, float))
-    if m == "MAE":
-        return e.abs().rolling(w).mean().values
-    if m == "RMSE":
-        return np.sqrt((e ** 2).rolling(w).mean()).values
-    var = pd.Series(np.asarray(y, float)).rolling(w).var(ddof=0).replace(0, np.nan)
-    return (1 - (e ** 2).rolling(w).mean() / var).values
-
-
-def threshold(ref, t, m):
-    return ref - t * max(abs(ref), 1e-9) if m == "R²" else ref * (1 + t)
-
-
-def is_degraded(val, ref, t, m):
-    return val < threshold(ref, t, m) if m == "R²" else val > threshold(ref, t, m)
-
-
-def improvement(cand, base, m):  # positive = better
-    if m == "R²":
-        return (cand - base) / max(abs(base), 1e-9)
-    return (base - cand) / max(abs(base), 1e-9)
+    return float(mean_absolute_error(y, p)) if m == "MAE" else float(np.sqrt(mean_squared_error(y, p)))
 
 
 def psi(b, c):
     b, c = b.dropna(), c.dropna()
     if len(b) == 0 or len(c) == 0:
         return np.nan
-    if pd.api.types.is_numeric_dtype(b):
+    if is_num(b):
         cuts = np.unique(np.quantile(b, np.linspace(0.1, 0.9, 9)))
         pb = np.bincount(np.searchsorted(cuts, b.values, side="right"), minlength=len(cuts) + 1) / len(b)
         pc = np.bincount(np.searchsorted(cuts, c.values, side="right"), minlength=len(cuts) + 1) / len(c)
@@ -75,19 +122,13 @@ def raw_features(df, p):
          .replace([np.inf, -np.inf], np.nan).fillna(p["med"]))
     if p["cat"]:
         cat = df[p["cat"]].astype(object).fillna("__na__").astype(str)
-        D = pd.get_dummies(cat, dtype=float).reindex(columns=p["dcols"], fill_value=0.0)
-        X = pd.concat([X, D], axis=1)
+        X = pd.concat([X, pd.get_dummies(cat, dtype=float).reindex(columns=p["dcols"], fill_value=0.0)], axis=1)
     return X
 
 
-def make_X(df):  # scaler is fitted once on the baseline training rows and never refitted
+def make_X(df):  # scaler fitted once on baseline training rows; never refitted
     p = ss.S["p"]
     return p["sc"].transform(raw_features(df, p).values)
-
-
-def predict(model, df):
-    p = ss.S["p"]
-    return model.predict(make_X(df)) * p["ys"] + p["ym"]
 
 
 def scaled_y(y):
@@ -95,291 +136,248 @@ def scaled_y(y):
     return (np.asarray(y, float) - p["ym"]) / p["ys"]
 
 
-def shade(fig, x0, x1, color, row=None):
-    kw = dict(row=row, col=1) if row else {}
-    fig.add_vrect(x0=x0, x1=x1, fillcolor=color, opacity=0.12, line_width=0, layer="below", **kw)
+def predict(model, df):
+    p = ss.S["p"]
+    return model.predict(make_X(df)) * p["ys"] + p["ym"]
 
 
-# ---------------------------------------------------------------- baseline
-def init_baseline(df, target, feats, tcol, frac, lag):
+def init_baseline(df, target, feats, tcol, lag):
     d = df.copy()
-    if tcol != NONE:
-        d[tcol] = pd.to_datetime(d[tcol], errors="coerce")
+    if tcol:
+        d[tcol] = to_dt(d[tcol])
         d = d.dropna(subset=[tcol]).sort_values(tcol, kind="stable")
-    d[target] = pd.to_numeric(d[target], errors="coerce")
-    n_bad = int(d[target].isna().sum())
-    d = d.dropna(subset=[target]).reset_index(drop=True)  # labels are never invented
-    if n_bad:
-        st.warning(f"Dropped {n_bad} rows with a missing/non-numeric target.")
-    d["_x"] = d[tcol] if tcol != NONE else np.arange(len(d))
+    d[target] = pd.to_numeric(d[target], errors="coerce")  # missing targets stay missing (never invented)
+    d = d.reset_index(drop=True)
+    d["_x"] = d[tcol] if tcol else np.arange(len(d))
     feats = list(feats)
-    if lag:  # previous actual: known at prediction time (one-step-ahead)
+    if lag:  # no usable feature columns: use the previous actual value (known at prediction time)
         d["_lag1"] = d[target].shift(1)
         feats.append("_lag1")
         d = d.iloc[1:].reset_index(drop=True)
     n = len(d)
-    n_tr = int(n * frac)
-    if n_tr < 30 or n - n_tr < 30:
-        st.error(f"Not enough rows for a reliable split (total {n}, train {n_tr}, stream {n - n_tr}). Need ≥30 each.")
-        return
-    fit_n = int(n_tr * 0.85)  # last 15% of training = baseline reference (not fitted on)
+    n_tr = int(n * TRAIN_FRAC)
+    fit_n = int(n_tr * 0.85)  # last 15% of training = baseline reference, not fitted on
+    lab = d[target].notna().values
+    if lab.sum() == 0:
+        st.error("This CSV has no usable target values, so performance can't be measured. "
+                 "Supervised model updating requires labeled data.")
+        return False
+    if n_tr < 30 or n - n_tr < 30 or lab[:fit_n].sum() < 20 or lab[fit_n:n_tr].sum() < 5:
+        st.error(f"Not enough labeled rows for a reliable split ({n} rows, {int(lab.sum())} with a target value).")
+        return False
     fit = d.iloc[:fit_n]
-    num = [c for c in feats if pd.api.types.is_numeric_dtype(d[c])]
+    fit = fit[fit[target].notna()]
+    num = [c for c in feats if is_num(d[c]) or pd.api.types.is_bool_dtype(d[c])]
     cat = [c for c in feats if c not in num]
-    wide = [c for c in cat if d[c].nunique() > 30]
-    if wide:
-        st.warning(f"Skipped high-cardinality columns: {wide}")
-    cat = [c for c in cat if c not in wide]
-    if not num and not cat:
-        st.error("No usable feature columns.")
-        return
     p = dict(num=num, cat=cat, med=fit[num].apply(pd.to_numeric, errors="coerce").median().fillna(0))
-    p["dcols"] = list(pd.get_dummies(fit[cat].astype(object).fillna("__na__").astype(str), dtype=float).columns) if cat else []
+    p["dcols"] = (list(pd.get_dummies(fit[cat].astype(object).fillna("__na__").astype(str), dtype=float).columns)
+                  if cat else [])
     p["ym"], p["ys"] = float(fit[target].mean()), float(fit[target].std() or 1.0)
     p["sc"] = StandardScaler().fit(raw_features(fit, p).values)
-    ss.S = dict(d=d, feats=num + cat, target=target, n_tr=n_tr, fit_n=fit_n, p=p)
+    ss.S = dict(d=d, feats=num + cat, target=target, n_tr=n_tr, fit_n=fit_n, p=p, lag=lag)
     model = SGDRegressor(random_state=0).fit(make_X(fit), scaled_y(fit[target]))
     ss.S["model"] = model
-    ss.S["pred"] = predict(model, d)  # features only; no stream labels are used
-    ss.pos, ss.cands, ss.split_key, ss.drift = 0, {}, None, None
-    ss.active, ss.amodel = "Original model", None
+    ss.S["pred"] = predict(model, d)  # predictions use features only
+    ss.result, ss.active, ss.amodel = None, "Original model", None
+    return True
 
 
-# ---------------------------------------------------------------- sidebar
+# ---------------------------------------------------------------- 1. automatic setup
+st.title("Model Drift Monitor")
+st.caption("Simulated live data: CSV rows are replayed in time order (not a real production stream).")
 sb = st.sidebar
-sb.header("Controls")
-up = sb.file_uploader("CSV file", type="csv")
-path = sb.text_input("…or path to existing CSV", "")
-raw = None
+sb.header("Data")
+up = sb.file_uploader("Upload a CSV (optional)", type="csv")
+files = sorted({os.path.abspath(f) for f in glob.glob(os.path.join(HERE, "*.csv")) + glob.glob("*.csv")})
 if up is not None:
-    raw = pd.read_csv(up)
-elif path and os.path.exists(path):
-    raw = pd.read_csv(path)
-elif path:
-    sb.error("Path not found.")
-
-st.title("Model Drift, Performance Monitoring & Retraining")
-st.caption("CSV-based live-stream simulation — rows are replayed in order; this is not a real-time production stream.")
-
-if raw is None:
-    st.info("Upload a CSV (or enter its path) in the sidebar.")
+    raw, name = read_bytes(up.getvalue()), up.name
+elif files:
+    f = files[0] if len(files) == 1 else sb.selectbox("CSV file", files, format_func=os.path.basename)
+    raw, name = read_path(f, os.path.getmtime(f)), os.path.basename(f)
+else:
+    st.info("Place a CSV next to app.py, or upload one in the sidebar.")
     st.stop()
 
-with st.expander("Dataset inspection", expanded=False):
-    st.write(f"{raw.shape[0]} rows × {raw.shape[1]} columns")
-    st.dataframe(pd.DataFrame({"dtype": raw.dtypes.astype(str), "missing": raw.isna().sum(),
-                               "unique": raw.nunique()}))
-    st.dataframe(raw.head())
-
-cols = list(raw.columns)
-num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(raw[c])]
-if not num_cols:
-    st.error("No numeric column found, so there is no suitable regression target.")
+tcol = find_time(raw)
+target, nums = find_target(raw, tcol)
+if not nums:
+    st.error("No numeric column found to predict.")
     st.stop()
-target = sb.selectbox("Target column", num_cols, index=len(num_cols) - 1)
-tcol = sb.selectbox("Timestamp column", [NONE] + cols)
-feats = sb.multiselect("Feature columns", [c for c in cols if c not in (target, tcol)],
-                       default=[c for c in num_cols if c != target and c != tcol])
-lag = sb.checkbox("Add previous target (lag-1) as feature", value=False)
-frac = sb.slider("Initial training proportion", 0.3, 0.9, 0.7, 0.05)
-metric = sb.selectbox("Performance metric", METRICS)
-win = sb.number_input("Rolling window (rows)", 5, 1000, 30)
-thr_pct = sb.slider("Degradation threshold (% worse than baseline)", 5, 200, 30) / 100
-delay = sb.number_input("Label delay (rows)", 0, 500, 0, help="Actuals arrive this many rows after the prediction.")
-if sb.button("Initialize / train baseline", type="primary"):
-    if not feats and not lag:
-        sb.error("Select at least one feature.")
-    else:
-        init_baseline(raw, target, feats, tcol, frac, lag)
+if target is None:
+    target = sb.selectbox("Which column should be predicted?", nums, index=len(nums) - 1)
+feats = pick_features(raw, target, tcol)
+lag = not feats
+sb.caption(f"**File:** {name} ({len(raw):,} rows)  \n**Predicting:** {target}  \n"
+           f"**Time column:** {tcol or 'row order'}  \n**Input columns:** {len(feats) if feats else 'previous value'}")
 
+sig = (name, len(raw), target, tcol)
+if ss.get("sig") != sig:
+    ss.pop("S", None)
+    ss.sig = sig if init_baseline(raw, target, feats, tcol, lag) else None
+    if "S" in ss:
+        ss.pos = 0
 if "S" not in ss:
-    st.info("Configure the sidebar and click **Initialize / train baseline**.")
     st.stop()
 
 S = ss.S
 d, n_tr, fit_n, tgt = S["d"], S["n_tr"], S["fit_n"], S["target"]
 n_stream = len(d) - n_tr
+batch = max(10, n_stream // 10)
+win = int(np.clip(n_stream // 10, 10, 50))
+if ss.pos == 0:
+    ss.pos = min(batch, n_stream)
+
+# ---------------------------------------------------------------- 4. simulate incoming data
+sb.header("Live simulation")
+if sb.button("Process next batch", type="primary"):
+    ss.pos = min(ss.pos + batch, n_stream)
+if sb.button("Process all rows"):
+    ss.pos = n_stream
+if sb.button("Restart"):
+    ss.pos, ss.result, ss.active, ss.amodel = min(batch, n_stream), None, "Original model", None
+k = ss.pos
 y_all, p_all, xs = d[tgt].values, S["pred"], d["_x"]
 
-# ---------------------------------------------------------------- stream controls
-c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
-batch = c1.number_input("Batch size", 1, max(n_stream, 1), min(50, n_stream))
-if c2.button("Process next batch"):
-    ss.pos = min(ss.pos + batch, n_stream)
-if c3.button("Process all"):
-    ss.pos = n_stream
-if c4.button("Reset stream"):
-    ss.pos, ss.cands, ss.split_key, ss.drift = 0, {}, None, None
-k = ss.pos
-st.progress(k / n_stream, text=f"Processed {k} / {n_stream} stream rows · active model: {ss.active}")
-if k == 0:
-    st.info("Process a batch to start the simulation.")
-    st.stop()
-
-# ---------------------------------------------------------------- monitoring
-lab = max(k - delay, 0)  # rows whose actuals have arrived
-ref = score(y_all[fit_n:n_tr], p_all[fit_n:n_tr], metric)
-roll = roll_metric(y_all[n_tr:n_tr + lab], p_all[n_tr:n_tr + lab], win, metric)
-bad = np.where(~np.isnan(roll) & is_degraded(roll, ref, thr_pct, metric))[0] if lab >= win else []
+# ---------------------------------------------------------------- monitoring numbers
+stream = d.iloc[n_tr:n_tr + k]
+ys, ps = stream[tgt].values, p_all[n_tr:n_tr + k]
+L = np.where(~np.isnan(ys))[0]  # processed rows whose actual value is known
+yl, pl, xl, lab = ys[L], ps[L], stream["_x"].iloc[L], len(L)
+vm = ~np.isnan(y_all[fit_n:n_tr])
+ref_mae = score(y_all[fit_n:n_tr][vm], p_all[fit_n:n_tr][vm], "MAE")
+limit = ref_mae * (1 + DEGRADE_PCT)
+roll = pd.Series(np.abs(yl - pl)).rolling(win).mean().values
+bad = np.where(roll > limit)[0]
 d_rel = int(bad[0]) if len(bad) else None
-ss.drift = d_rel
 onset = max(d_rel - win + 1, 0) if d_rel is not None else None
-x_stream = xs.iloc[n_tr:n_tr + k]
 
-if delay and k - lab:
-    st.caption(f"⏳ {k - lab} most recent rows are pending labels (delay = {delay}); metrics use labeled rows only.")
-if lab < win:
-    st.warning(f"Performance metric pending: need {win} labeled rows (have {lab}).")
-elif d_rel is None:
-    st.success(f"No performance degradation detected so far (reference {metric} = {ref:.4g}).")
+if lab == 0:
+    status, note = "Not measurable", "No actual values yet — performance can't be measured. Updating requires labeled data."
+elif lab < win:
+    status, note = "Collecting data", f"Need {win} rows with actual values (have {lab})."
+elif d_rel is not None:
+    status, note = "⚠️ Degraded", "Error rose above the allowed limit."
 else:
-    st.error(f"Performance degradation detected at stream row {d_rel + delay} "
-             f"(approx. onset: row {onset}). Data drift alone does not confirm concept drift.")
+    status, note = "✅ Healthy", "Error is within the allowed limit."
 
-# Graph 1
+cur = score(yl[-win:], pl[-win:], "MAE") if lab else np.nan
+r = ss.get("result")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Records processed", f"{k:,} / {n_stream:,}")
+c2.metric("Current error (MAE)", "—" if lab == 0 else f"{cur:.3g}",
+          delta=None if lab == 0 else f"{(cur / ref_mae - 1) * 100:+.0f}% vs baseline", delta_color="inverse")
+c3.metric("Model status", status)
+c4.metric("Original → Updated (MAE)", "No update yet" if not r else f"{r['base'][0]:.3g} → {r['new'][0]:.3g}")
+(st.warning if lab == 0 else st.info)(note)
+if k - lab and lab:
+    st.caption(f"{k - lab} processed rows have no actual value; they are predicted but not scored.")
+
+# ---------------------------------------------------------------- graphs
 st.subheader("1 · Actual vs Predicted")
 n_show = n_tr + k
 g1 = go.Figure()
 g1.add_scatter(x=xs[:n_show], y=y_all[:n_show], name="Actual", line=dict(color="#444", width=1))
-g1.add_scatter(x=xs[:n_show], y=p_all[:n_show], name="Original model", line=dict(color="#1f77b4", width=1))
+g1.add_scatter(x=xs[:n_show], y=p_all[:n_show], name="Predicted", line=dict(color="#1f77b4", width=1))
 if ss.amodel is not None:
-    g1.add_scatter(x=x_stream, y=predict(ss.amodel, d.iloc[n_tr:n_tr + k]), name=f"Active: {ss.active}",
+    g1.add_scatter(x=stream["_x"], y=predict(ss.amodel, stream), name="Updated model",
                    line=dict(color="#2ca02c", width=1))
-shade(g1, xs.iloc[0], xs.iloc[n_tr - 1], "#1f77b4")
+g1.add_vrect(x0=xs.iloc[0], x1=xs.iloc[n_tr - 1], fillcolor="#1f77b4", opacity=0.10, line_width=0, layer="below")
 if d_rel is not None:
-    shade(g1, xs.iloc[n_tr + onset], xs.iloc[n_show - 1], "#d62728")
-    g1.add_scatter(x=[xs.iloc[n_tr + d_rel]], y=[y_all[n_tr + d_rel]], mode="markers", name="Degradation detected",
+    g1.add_vrect(x0=xl.iloc[onset], x1=xs.iloc[n_show - 1], fillcolor="#d62728", opacity=0.10, line_width=0, layer="below")
+    g1.add_scatter(x=[xl.iloc[d_rel]], y=[yl[d_rel]], mode="markers", name="Degradation detected",
                    marker=dict(color="red", size=11, symbol="x"))
-g1.update_layout(height=380, margin=dict(t=20), legend=dict(orientation="h"),
-                 xaxis_title="Time / index", yaxis_title=tgt)
+g1.update_layout(height=340, margin=dict(t=10, b=10), legend=dict(orientation="h"), yaxis_title=tgt)
 st.plotly_chart(g1, width="stretch")
-st.caption("Blue shading: baseline training period · Red shading: post-drift period (from approximate onset).")
+st.caption("Blue = initial training period · Red = after degradation.")
 
-# Graph 2
-st.subheader("2 · Model Performance / Degradation")
+st.subheader("2 · Model Performance Over Time")
 g2 = go.Figure()
-if metric != "R²":
-    g2.add_scatter(x=x_stream.iloc[:lab], y=np.abs(y_all[n_tr:n_tr + lab] - p_all[n_tr:n_tr + lab]),
-                   name="Absolute error", line=dict(color="#bbb", width=1))
-g2.add_scatter(x=x_stream.iloc[:lab], y=roll, name=f"Rolling {metric}", line=dict(color="#1f77b4"))
-g2.add_hline(y=threshold(ref, thr_pct, metric), line_dash="dash", line_color="red", annotation_text="Threshold")
-g2.add_hline(y=ref, line_dash="dot", line_color="green", annotation_text="Baseline reference")
-if lab:
-    shade(g2, x_stream.iloc[0], x_stream.iloc[(onset if d_rel is not None else lab - 1)], "#2ca02c")
+g2.add_scatter(x=xl, y=roll, name="Recent error (MAE)", line=dict(color="#1f77b4"))
+g2.add_hline(y=limit, line_dash="dash", line_color="red", annotation_text="Allowed limit")
+g2.add_hline(y=ref_mae, line_dash="dot", line_color="green", annotation_text="Baseline")
 if d_rel is not None:
-    shade(g2, x_stream.iloc[onset], x_stream.iloc[lab - 1], "#d62728")
-    g2.add_scatter(x=[x_stream.iloc[d_rel]], y=[roll[d_rel]], mode="markers", name="Degradation detected",
+    g2.add_vrect(x0=xl.iloc[onset], x1=xl.iloc[-1], fillcolor="#d62728", opacity=0.10, line_width=0, layer="below")
+    g2.add_scatter(x=[xl.iloc[d_rel]], y=[roll[d_rel]], mode="markers", name="Degradation detected",
                    marker=dict(color="red", size=12, symbol="x"))
-g2.update_layout(height=340, margin=dict(t=20), legend=dict(orientation="h"), xaxis_title="Time / index",
-                 yaxis_title=metric)
+g2.update_layout(height=300, margin=dict(t=10, b=10), legend=dict(orientation="h"), yaxis_title="MAE")
 st.plotly_chart(g2, width="stretch")
-st.caption("Green: pre-drift · Red: post-drift. The baseline reference uses the last 15% of the training segment, which the model was not fitted on.")
 
-# Graph 3
-st.subheader("3 · Data Drift (PSI)")
-pc1, pc2, pc3 = st.columns(3)
-base_n = pc1.slider("Baseline window (first N training rows)", 20, n_tr, min(n_tr, 200))
-cur_n = pc2.slider("Current window (latest N processed rows)", 10, max(k, 11), min(max(k, 11), 100))
-psi_t = pc3.slider("PSI threshold", 0.05, 0.5, 0.2, 0.05)
-bw, cw = d.iloc[:base_n], d.iloc[n_tr + max(k - cur_n, 0):n_tr + k]
-ps = pd.Series({f: psi(bw[f], cw[f]) for f in S["feats"]})
-g3 = go.Figure(go.Bar(x=ps.index, y=ps.values, marker_color=["#d62728" if v > psi_t else "#1f77b4" for v in ps.fillna(0)]))
-g3.add_hline(y=psi_t, line_dash="dash", line_color="red")
-g3.update_layout(height=320, margin=dict(t=20), yaxis_title="PSI")
-st.plotly_chart(g3, width="stretch")
-over = ps[ps > psi_t].index.tolist()
-st.caption(f"Features above threshold: {over if over else 'none'}. PSI flags input distribution change only; it does not prove concept drift.")
-
-# ---------------------------------------------------------------- retraining
-st.header("Model Update / Retraining")
-if d_rel is None:
-    st.info("Available once performance degradation is detected.")
-    st.stop()
-
-ev_frac = st.slider("Held-out evaluation share of post-drift labeled rows", 0.2, 0.5, 0.3, 0.05)
-gap = st.number_input("Purge gap between training and evaluation rows", 0, 100, 1 if lag else 0,
-                      help="Rows skipped so overlapping windows/lag features can't leak into evaluation.")
-m_pool = lab - onset
-n_ev = int(m_pool * ev_frac)
-tr_end, ev_s = onset + m_pool - n_ev - gap, onset + m_pool - n_ev  # stream-relative
-if tr_end - onset < 10 or n_ev < 10:
-    st.warning(f"Not enough labeled post-drift rows yet (pool {m_pool}). Process more data.")
-    st.stop()
-key = (onset, tr_end, ev_s, lab)
-if ss.split_key != key:
-    if ss.cands:
-        st.warning("Evaluation split changed with new data — previous candidates cleared; retrain them.")
-    ss.cands, ss.split_key = {}, key
-pool_n = tr_end - onset
-ev = d.iloc[n_tr + ev_s:n_tr + lab]
-st.caption(f"Post-drift labeled pool: {pool_n} training rows (stream {onset}–{tr_end - 1}) · "
-           f"{n_ev} held-out evaluation rows (stream {ev_s}–{lab - 1}) · scaler/target scaling stay fixed from the baseline.")
-
-tabs = st.tabs(STRATS)
-for strat, tab in zip(STRATS, tabs):
-    with tab:
-        n_new = st.slider(f"New rows to use ({strat})", min(10, pool_n), pool_n, pool_n)
-        epochs = st.slider(f"Passes ({strat})", 1, 20, 3) if strat == "Incremental update" else 1
-        new = d.iloc[n_tr + tr_end - n_new:n_tr + tr_end]  # most recent labeled rows before the gap
-        n_rows = n_new + (n_tr if strat == "Old data + new data" else 0)
-        st.write(f"Training rows: **{n_rows}**")
-        if st.button("Run update", key=f"run_{strat}"):
-            if strat == "Incremental update":
-                m = copy.deepcopy(S["model"])
-                Xn, yn = make_X(new), scaled_y(new[tgt])
-                for _ in range(epochs):
-                    m.partial_fit(Xn, yn)
-            else:
-                tr = pd.concat([d.iloc[:n_tr], new]) if strat == "Old data + new data" else new
-                m = SGDRegressor(random_state=0).fit(make_X(tr), scaled_y(tr[tgt]))
-            ss.cands[strat] = dict(model=m, rows=n_rows)
-
-# ---------------------------------------------------------------- evaluation
-st.subheader("Evaluation on held-out post-drift rows")
-y_ev = ev[tgt].values
-p_base = p_all[n_tr + ev_s:n_tr + lab]
-rows = [dict(Model="Original model", Rows=fit_n, **{m: score(y_ev, p_base, m) for m in METRICS}, Change="—", Accept="—")]
-preds = {}
-accepted = {}
-min_gain = st.slider("Acceptance: minimum improvement on selected metric (%)", 0, 50, 5) / 100
-b_val = score(y_ev, p_base, metric)
-for s, c in ss.cands.items():
-    preds[s] = predict(c["model"], ev)
-    vals = {m: score(y_ev, preds[s], m) for m in METRICS}
-    gain = improvement(vals[metric], b_val, metric)
-    accepted[s] = bool(gain >= min_gain)
-    rows.append(dict(Model=s, Rows=c["rows"], **vals, Change=f"{gain * 100:+.1f}%",
-                     Accept="✅" if accepted[s] else "❌"))
-if not ss.cands:
-    st.info("Run at least one update to compare against the original model.")
+st.subheader("3 · Data Drift")
+if k < 20:
+    st.info("Process at least 20 records to check for data drift.")
 else:
-    st.dataframe(pd.DataFrame(rows).style.format({m: "{:.4g}" for m in METRICS}), width="stretch", hide_index=True)
-    st.caption(f"Change = improvement ({metric}) vs the original model; positive is better.")
+    base, recent = d.iloc[:n_tr], d.iloc[n_tr + max(k - 100, 0):n_tr + k]
+    ps_ = pd.Series({f: psi(base[f], recent[f]) for f in S["feats"]}).dropna().sort_values(ascending=False).head(12)
+    g3 = go.Figure(go.Bar(x=ps_.index, y=ps_.values,
+                          marker_color=["#d62728" if v > PSI_LIMIT else "#1f77b4" for v in ps_.values]))
+    g3.add_hline(y=PSI_LIMIT, line_dash="dash", line_color="red")
+    g3.update_layout(height=280, margin=dict(t=10, b=10), yaxis_title="Shift score (PSI)")
+    st.plotly_chart(g3, width="stretch")
+    shifted = ps_[ps_ > PSI_LIMIT].index.tolist()
+    st.caption(("Incoming data differs from baseline for: " + ", ".join(shifted)) if shifted
+               else "Incoming data looks similar to baseline.")
+    st.caption("A data shift alone does not prove the model is worse — check graph 2.")
 
-    st.subheader("4 · Model Performance Comparison")
-    names = ["Original (before)"] + [f"{s} (after)" for s in ss.cands]
-    g4 = go.Figure(go.Bar(x=names, y=[b_val] + [r[metric] for r in rows[1:]],
-                          marker_color=["#888"] + ["#2ca02c" if accepted[s] else "#d62728" for s in ss.cands]))
-    g4.update_layout(height=320, margin=dict(t=20), yaxis_title=metric)
+# ---------------------------------------------------------------- 3. update model
+st.header("Update Model")
+if lab == 0:
+    st.info("Model updating needs actual target values (labels). None are available yet.")
+    st.stop()
+opt = st.radio("Training data", OPTIONS, captions=[
+    "Fresh model on recent labeled data", "Fresh model on original + recent labeled data",
+    "Continue training the current model on recent data"])
+
+# recent labeled data: from the degradation point if detected, otherwise the latest rows
+start = onset if d_rel is not None else max(lab - 4 * win, 0)
+n_ev = int((lab - start) * EVAL_FRAC)
+gap = 1 if lag else 0  # skip a row when the lag feature links neighbours
+tr_end, ev_s = lab - n_ev - gap, lab - n_ev
+dl = d.iloc[n_tr + L]  # labeled stream rows
+ready = tr_end - start >= 20 and n_ev >= 10
+if ready:
+    new, ev = dl.iloc[start:tr_end], dl.iloc[ev_s:lab]
+    n_train = len(new) + (int(d.iloc[:n_tr][tgt].notna().sum()) if opt == "Use Old + New Data" else 0)
+    st.caption(f"Training rows: {n_train} · Unseen evaluation rows: {len(ev)}")
+else:
+    st.info("Not enough recent labeled data yet — keep processing records.")
+
+if st.button("Update and Compare Model", type="primary", disabled=not ready):
+    if opt == "Update Existing Model":
+        model = copy.deepcopy(S["model"])  # original stays untouched
+        Xn, yn = make_X(new), scaled_y(new[tgt])
+        for _ in range(3):
+            model.partial_fit(Xn, yn)
+    else:
+        tr = new
+        if opt == "Use Old + New Data":
+            old = d.iloc[:n_tr]
+            tr = pd.concat([old[old[tgt].notna()], new])
+        model = SGDRegressor(random_state=0).fit(make_X(tr), scaled_y(tr[tgt]))
+    y_ev, p_old, p_new = ev[tgt].values, pl[ev_s:lab], predict(model, ev)
+    base_s = (score(y_ev, p_old, "MAE"), score(y_ev, p_old, "RMSE"))
+    new_s = (score(y_ev, p_new, "MAE"), score(y_ev, p_new, "RMSE"))
+    passed = new_s[0] <= base_s[0] * (1 - MIN_GAIN) and new_s[1] <= base_s[1]
+    ss.result = dict(opt=opt, base=base_s, new=new_s, passed=passed, n_eval=len(ev))
+    if passed:  # promote only after passing evaluation
+        ss.active, ss.amodel = opt, model
+    st.rerun()
+
+r = ss.get("result")
+if r:
+    b, n_ = r["base"], r["new"]
+    if r["passed"]:
+        st.success(f"Improved — the updated model ({r['opt']}) is now in use.")
+    elif n_[0] > b[0]:
+        st.error("Worse — the original model is kept.")
+    else:
+        st.warning("No meaningful improvement — the original model is kept.")
+    m1, m2 = st.columns(2)
+    m1.metric("MAE (updated)", f"{n_[0]:.3g}", delta=f"{n_[0] - b[0]:+.3g} vs original", delta_color="inverse")
+    m2.metric("RMSE (updated)", f"{n_[1]:.3g}", delta=f"{n_[1] - b[1]:+.3g} vs original", delta_color="inverse")
+    st.subheader("4 · Model Comparison")
+    g4 = go.Figure()
+    g4.add_bar(x=["MAE", "RMSE"], y=list(b), name="Original", marker_color="#888")
+    g4.add_bar(x=["MAE", "RMSE"], y=list(n_), name="Updated", marker_color="#2ca02c" if r["passed"] else "#d62728")
+    g4.update_layout(barmode="group", height=300, margin=dict(t=10, b=10), legend=dict(orientation="h"))
     st.plotly_chart(g4, width="stretch")
-
-    fe = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.06,
-                       subplot_titles=("Predictions", "Absolute error"))
-    fe.add_scatter(x=ev["_x"], y=y_ev, name="Actual", line=dict(color="#444"), row=1, col=1)
-    fe.add_scatter(x=ev["_x"], y=p_base, name="Original", line=dict(color="#1f77b4"), row=1, col=1)
-    fe.add_scatter(x=ev["_x"], y=np.abs(y_ev - p_base), name="Original", line=dict(color="#1f77b4"),
-                   showlegend=False, row=2, col=1)
-    for s, pr in preds.items():
-        fe.add_scatter(x=ev["_x"], y=pr, name=s, row=1, col=1)
-        fe.add_scatter(x=ev["_x"], y=np.abs(y_ev - pr), name=s, showlegend=False, row=2, col=1)
-    fe.update_layout(height=450, margin=dict(t=30), legend=dict(orientation="h"))
-    st.plotly_chart(fe, width="stretch")
-
-    st.subheader("Promote")
-    pick = st.selectbox("Candidate", list(ss.cands))
-    if not accepted[pick]:
-        st.warning("Candidate does not meet the acceptance criterion — the original model stays active.")
-    if st.button("Promote Candidate Model", disabled=not accepted[pick]):
-        ss.active, ss.amodel = pick, copy.deepcopy(ss.cands[pick]["model"])
-        st.success(f"Promoted: {pick}. It is now shown as the active model in Graph 1.")
-        st.rerun()
+    st.caption(f"Both models scored on the same {r['n_eval']} unseen rows that were never used for training.")
