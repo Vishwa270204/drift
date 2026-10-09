@@ -1,383 +1,404 @@
-import copy
-import glob
-import io
-import os
-import warnings
-
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.linear_model import SGDRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-st.set_page_config(page_title="Model Drift Monitor", layout="wide")
-ss = st.session_state
-HERE = os.path.dirname(os.path.abspath(__file__))
+st.set_page_config(
+    page_title="Drift & Learning Strategy Lab",
+    page_icon="📈",
+    layout="wide",
+)
 
-# ---- sensible defaults (no manual settings) ----
-TRAIN_FRAC = 0.70      # first 70% of rows = initial training data
-DEGRADE_PCT = 0.30     # degraded when recent error is 30% above baseline error
-PSI_LIMIT = 0.20       # common rule of thumb for a significant input shift
-EVAL_FRAC = 0.30       # share of recent labeled rows kept unseen for evaluation
-MIN_GAIN = 0.05        # updated model must cut MAE by at least 5% (and not worsen RMSE)
-OPTIONS = ["Use New Data Only", "Use Old + New Data", "Update Existing Model"]
-TARGET_WORDS = ["target", "label", "y", "output", "response", "price", "sales", "demand", "value",
-                "load", "close", "revenue", "count", "temperature", "consumption", "energy", "power", "amount"]
+st.title("📈 Model Drift & Learning Strategy Comparison")
+st.caption(
+    "Compare incremental learning, continual learning, and transfer learning "
+    "on a simulated live sensor-forecasting problem."
+)
 
+st.info(
+    "This is a controlled simulation for learning and demonstration. "
+    "Synthetic outcomes are available so the dashboard can measure prediction error. "
+    "Real systems may have delayed or missing labels."
+)
 
-# ---------------------------------------------------------------- loading & auto-detection
-@st.cache_data
-def read_path(path, mtime):
-    return pd.read_csv(path)
+with st.sidebar:
+    st.header("Simulation settings")
+    n_rows = st.slider("Number of time steps", 1500, 10000, 4000, step=500)
+    drift_point_pct = st.slider("Drift begins at (%)", 40, 80, 60, step=5)
+    drift_type = st.selectbox(
+        "Drift type",
+        ["Concept drift", "Data drift", "Both data + concept drift"],
+        index=2,
+        help=(
+            "Data drift changes the input distribution. Concept drift changes "
+            "the relationship between inputs and the target."
+        ),
+    )
+    noise = st.slider("Sensor/target noise", 0.1, 5.0, 1.0, 0.1)
+    batch_size = st.slider("Update batch size", 16, 256, 64, step=16)
+    replay_size = st.slider("Continual-learning replay examples", 0, 1000, 200, step=50)
+    source_similarity = st.slider(
+        "Transfer source similarity", 0.2, 1.0, 0.8, 0.1,
+        help="Higher means the source machine/task is more similar to the target."
+    )
+    random_seed = st.number_input("Random seed", min_value=0, max_value=9999, value=42, step=1)
+    run_button = st.button("Run comparison", type="primary", use_container_width=True)
 
+if "results" not in st.session_state:
+    st.session_state.results = None
 
-@st.cache_data
-def read_bytes(b):
-    return pd.read_csv(io.BytesIO(b))
+def make_data(n, drift_point_pct, drift_type, noise, source_similarity, seed):
+    """Generate a time-ordered sensor series with controllable drift."""
+    rng = np.random.default_rng(int(seed))
+    t = np.arange(n)
+    drift_idx = int(n * drift_point_pct / 100.0)
 
+    # Sensor features with seasonal and slowly changing behavior.
+    temp = 25 + 4 * np.sin(2 * np.pi * t / 120) + 0.0015 * t + rng.normal(0, 0.7, n)
+    pressure = 40 + 3 * np.sin(2 * np.pi * t / 75 + 0.6) + rng.normal(0, 0.8, n)
+    vibration = 3 + 0.5 * np.sin(2 * np.pi * t / 35) + rng.normal(0, 0.15, n)
 
-def to_dt(s):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        try:
-            return pd.to_datetime(s, errors="coerce", format="mixed")
-        except (TypeError, ValueError):
-            return pd.to_datetime(s, errors="coerce")
+    is_data_drift = drift_type in ("Data drift", "Both data + concept drift")
+    is_concept_drift = drift_type in ("Concept drift", "Both data + concept drift")
 
+    if is_data_drift:
+        temp[drift_idx:] += 5.0
+        pressure[drift_idx:] += 4.0
+        vibration[drift_idx:] += 0.8
 
-def is_num(s):
-    return pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s)
+    # Before drift, target follows a stable nonlinear-ish sensor relationship.
+    y = (
+        0.9 * temp
+        + 0.55 * pressure
+        + 4.5 * vibration
+        + 2.5 * np.sin(temp / 5)
+        + 0.012 * t
+    )
 
+    if is_concept_drift:
+        # Relationship between inputs and target changes after the drift point.
+        y[drift_idx:] = (
+            0.45 * temp[drift_idx:]
+            + 0.95 * pressure[drift_idx:]
+            + 10.0 * vibration[drift_idx:]
+            + 4.0 * np.cos(pressure[drift_idx:] / 6)
+            + 0.004 * t[drift_idx:]
+            + 8.0
+        )
 
-def find_time(df):
-    for c in df.columns:
-        if pd.api.types.is_datetime64_any_dtype(df[c]):
-            return c
-    for c in df.columns:
-        if is_num(df[c]) or pd.api.types.is_bool_dtype(df[c]):
-            continue
-        smp = df[c].dropna().head(200)
-        if len(smp) and to_dt(smp).notna().mean() >= 0.9:
-            return c
-    return None
+    y += rng.normal(0, noise, n)
 
+    frame = pd.DataFrame({
+        "time_step": t,
+        "temperature": temp,
+        "pressure": pressure,
+        "vibration": vibration,
+        "target": y,
+        "period": np.where(t < drift_idx, "Before drift", "After drift"),
+    })
 
-def find_target(df, tcol):
-    nums = [c for c in df.columns if c != tcol and is_num(df[c]) and df[c].nunique() > 5]
-    low = {c: c.lower().strip() for c in nums}
-    exact = [c for c in nums if low[c] in TARGET_WORDS]
-    if len(exact) == 1:
-        return exact[0], nums
-    part = [c for c in nums if any(w in low[c] for w in TARGET_WORDS if len(w) > 3)]
-    if not exact and len(part) == 1:
-        return part[0], nums
-    return None, nums  # not confident -> ask
+    # Related source-domain dataset used only by the transfer strategy.
+    n_source = max(500, drift_idx)
+    src_rng = np.random.default_rng(int(seed) + 101)
+    st = np.arange(n_source)
+    src_temp = 24 + 3.5 * np.sin(2 * np.pi * st / 120) + src_rng.normal(0, 0.7, n_source)
+    src_pressure = 39 + 2.5 * np.sin(2 * np.pi * st / 75 + 0.6) + src_rng.normal(0, 0.8, n_source)
+    src_vibration = 2.8 + 0.4 * np.sin(2 * np.pi * st / 35) + src_rng.normal(0, 0.15, n_source)
 
+    # Source task is similar, with controllable difference in its target mapping.
+    similarity = float(source_similarity)
+    src_y = (
+        (0.9 * similarity + 0.25) * src_temp
+        + (0.55 * similarity + 0.25) * src_pressure
+        + (4.5 * similarity + 1.5) * src_vibration
+        + 2.5 * np.sin(src_temp / 5)
+        + 0.01 * st
+        + src_rng.normal(0, noise, n_source)
+    )
+    source = pd.DataFrame({
+        "temperature": src_temp,
+        "pressure": src_pressure,
+        "vibration": src_vibration,
+        "target": src_y,
+    })
+    return frame, source, drift_idx
 
-def pick_features(df, target, tcol):
-    out = []
-    for c in df.columns:
-        s = df[c]
-        if c in (target, tcol) or s.isna().mean() > 0.5 or s.nunique() <= 1:
-            continue
-        if c.lower() in ("id", "index") or c.lower().endswith("_id"):
-            continue
-        if not is_num(s) and s.nunique() > 30:
-            continue
-        if s.nunique() == len(s) and not pd.api.types.is_float_dtype(s):
-            continue  # looks like an ID / row counter
-        out.append(c)
-    return out
+FEATURES = ["temperature", "pressure", "vibration"]
 
+def new_model(seed):
+    return MLPRegressor(
+        hidden_layer_sizes=(48, 24),
+        activation="relu",
+        solver="adam",
+        learning_rate_init=0.002,
+        max_iter=1,
+        warm_start=True,
+        random_state=int(seed),
+        shuffle=False,
+    )
 
-# ---------------------------------------------------------------- model helpers
-def score(y, p, m):
-    y, p = np.asarray(y, float), np.asarray(p, float)
-    if len(y) == 0:
-        return np.nan
-    return float(mean_absolute_error(y, p)) if m == "MAE" else float(np.sqrt(mean_squared_error(y, p)))
+def fit_epochs(model, X, y, epochs=12):
+    # Repeated fit with warm_start makes a compact educational training loop.
+    for _ in range(epochs):
+        model.fit(X, y)
+    return model
 
+def score(y_true, y_pred):
+    return {
+        "MAE": float(mean_absolute_error(y_true, y_pred)),
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+    }
 
-def psi(b, c):
-    b, c = b.dropna(), c.dropna()
-    if len(b) == 0 or len(c) == 0:
-        return np.nan
-    if is_num(b):
-        cuts = np.unique(np.quantile(b, np.linspace(0.1, 0.9, 9)))
-        pb = np.bincount(np.searchsorted(cuts, b.values, side="right"), minlength=len(cuts) + 1) / len(b)
-        pc = np.bincount(np.searchsorted(cuts, c.values, side="right"), minlength=len(cuts) + 1) / len(c)
-    else:
-        b, c = b.astype(str), c.astype(str)
-        cats = sorted(set(b) | set(c))
-        pb = b.value_counts(normalize=True).reindex(cats, fill_value=0).values
-        pc = c.value_counts(normalize=True).reindex(cats, fill_value=0).values
-    pb, pc = np.clip(pb, 1e-4, None), np.clip(pc, 1e-4, None)
-    return float(np.sum((pc - pb) * np.log(pc / pb)))
+def run_experiment(n_rows, drift_point_pct, drift_type, noise, batch_size, replay_size, source_similarity, seed):
+    df, source, drift_idx = make_data(
+        n_rows, drift_point_pct, drift_type, noise, source_similarity, seed
+    )
 
+    # Chronological partitions:
+    # initial training ends before drift; adaptation data comes after drift;
+    # final test is later than adaptation data and is never used for updates.
+    train_end = max(200, int(drift_idx * 0.85))
+    post_start = drift_idx
+    post_len = n_rows - post_start
+    adapt_end = post_start + max(50, int(post_len * 0.55))
+    adapt_end = min(adapt_end, n_rows - 20)
 
-def raw_features(df, p):
-    X = (df[p["num"]].apply(pd.to_numeric, errors="coerce")
-         .replace([np.inf, -np.inf], np.nan).fillna(p["med"]))
-    if p["cat"]:
-        cat = df[p["cat"]].astype(object).fillna("__na__").astype(str)
-        X = pd.concat([X, pd.get_dummies(cat, dtype=float).reindex(columns=p["dcols"], fill_value=0.0)], axis=1)
-    return X
+    initial = df.iloc[:train_end].copy()
+    post_adapt = df.iloc[post_start:adapt_end].copy()
+    test = df.iloc[adapt_end:].copy()
 
+    if len(post_adapt) < 20 or len(test) < 20:
+        raise ValueError("Not enough post-drift rows. Increase time steps or move drift earlier.")
 
-def make_X(df):  # scaler fitted once on baseline training rows; never refitted
-    p = ss.S["p"]
-    return p["sc"].transform(raw_features(df, p).values)
+    # Standardization is fitted only on the original training data to avoid leakage.
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(initial[FEATURES])
+    X_adapt = scaler.transform(post_adapt[FEATURES])
+    X_test = scaler.transform(test[FEATURES])
+    y_train = initial["target"].to_numpy()
+    y_adapt = post_adapt["target"].to_numpy()
+    y_test = test["target"].to_numpy()
 
+    # Shared original model, cloned by independently fitting the same architecture.
+    baseline = fit_epochs(new_model(seed), X_train, y_train, epochs=18)
+    baseline_pred = baseline.predict(X_test)
+    baseline_metrics = score(y_test, baseline_pred)
 
-def scaled_y(y):
-    p = ss.S["p"]
-    return (np.asarray(y, float) - p["ym"]) / p["ys"]
+    # Incremental: update same architecture in sequential mini-batches.
+    incremental = fit_epochs(new_model(seed), X_train, y_train, epochs=18)
+    for start in range(0, len(X_adapt), batch_size):
+        end = min(start + batch_size, len(X_adapt))
+        incremental = fit_epochs(incremental, X_adapt[start:end], y_adapt[start:end], epochs=3)
+    inc_pred = incremental.predict(X_test)
+    inc_metrics = score(y_test, inc_pred)
 
+    # Continual: mini-batch updates plus replay samples from historical training data.
+    continual = fit_epochs(new_model(seed), X_train, y_train, epochs=18)
+    rng = np.random.default_rng(int(seed) + 7)
+    X_old = X_train
+    y_old = y_train
+    for start in range(0, len(X_adapt), batch_size):
+        end = min(start + batch_size, len(X_adapt))
+        X_batch = X_adapt[start:end]
+        y_batch = y_adapt[start:end]
+        if replay_size > 0:
+            count = min(replay_size, len(X_old))
+            idx = rng.choice(len(X_old), size=count, replace=False)
+            X_update = np.vstack([X_batch, X_old[idx]])
+            y_update = np.concatenate([y_batch, y_old[idx]])
+        else:
+            X_update, y_update = X_batch, y_batch
+        continual = fit_epochs(continual, X_update, y_update, epochs=3)
+    cont_pred = continual.predict(X_test)
+    cont_metrics = score(y_test, cont_pred)
 
-def predict(model, df):
-    p = ss.S["p"]
-    return model.predict(make_X(df)) * p["ys"] + p["ym"]
+    # Transfer: pretrain the same architecture on a related source domain, then adapt
+    # using the target's pre-drift training data and fine-tune on post-drift labels.
+    transfer_scaler = StandardScaler()
+    X_source = transfer_scaler.fit_transform(source[FEATURES])
+    X_initial_t = transfer_scaler.transform(initial[FEATURES])
+    X_adapt_t = transfer_scaler.transform(post_adapt[FEATURES])
+    X_test_t = transfer_scaler.transform(test[FEATURES])
 
+    transfer = fit_epochs(new_model(int(seed) + 13), X_source, source["target"].to_numpy(), epochs=18)
+    # Fine-tune on the target's pre-drift examples to establish the target domain.
+    transfer = fit_epochs(transfer, X_initial_t, y_train, epochs=8)
+    # Then adapt to the new regime.
+    for start in range(0, len(X_adapt_t), batch_size):
+        end = min(start + batch_size, len(X_adapt_t))
+        transfer = fit_epochs(transfer, X_adapt_t[start:end], y_adapt[start:end], epochs=3)
+    trans_pred = transfer.predict(X_test_t)
+    trans_metrics = score(y_test, trans_pred)
 
-def init_baseline(df, target, feats, tcol, lag):
-    d = df.copy()
-    if tcol:
-        d[tcol] = to_dt(d[tcol])
-        d = d.dropna(subset=[tcol]).sort_values(tcol, kind="stable")
-    d[target] = pd.to_numeric(d[target], errors="coerce")  # missing targets stay missing (never invented)
-    d = d.reset_index(drop=True)
-    d["_x"] = d[tcol] if tcol else np.arange(len(d))
-    feats = list(feats)
-    if lag:  # no usable feature columns: use the previous actual value (known at prediction time)
-        d["_lag1"] = d[target].shift(1)
-        feats.append("_lag1")
-        d = d.iloc[1:].reset_index(drop=True)
-    n = len(d)
-    n_tr = int(n * TRAIN_FRAC)
-    fit_n = int(n_tr * 0.85)  # last 15% of training = baseline reference, not fitted on
-    lab = d[target].notna().values
-    if lab.sum() == 0:
-        st.error("This CSV has no usable target values, so performance can't be measured. "
-                 "Supervised model updating requires labeled data.")
-        return False
-    if n_tr < 30 or n - n_tr < 30 or lab[:fit_n].sum() < 20 or lab[fit_n:n_tr].sum() < 5:
-        st.error(f"Not enough labeled rows for a reliable split ({n} rows, {int(lab.sum())} with a target value).")
-        return False
-    fit = d.iloc[:fit_n]
-    fit = fit[fit[target].notna()]
-    num = [c for c in feats if is_num(d[c]) or pd.api.types.is_bool_dtype(d[c])]
-    cat = [c for c in feats if c not in num]
-    p = dict(num=num, cat=cat, med=fit[num].apply(pd.to_numeric, errors="coerce").median().fillna(0))
-    p["dcols"] = (list(pd.get_dummies(fit[cat].astype(object).fillna("__na__").astype(str), dtype=float).columns)
-                  if cat else [])
-    p["ym"], p["ys"] = float(fit[target].mean()), float(fit[target].std() or 1.0)
-    p["sc"] = StandardScaler().fit(raw_features(fit, p).values)
-    ss.S = dict(d=d, feats=num + cat, target=target, n_tr=n_tr, fit_n=fit_n, p=p, lag=lag)
-    model = SGDRegressor(random_state=0).fit(make_X(fit), scaled_y(fit[target]))
-    ss.S["model"] = model
-    ss.S["pred"] = predict(model, d)  # predictions use features only
-    ss.result, ss.active, ss.amodel = None, "Original model", None
-    return True
+    # Prediction series for charting.
+    pred_df = pd.DataFrame({
+        "time_step": test["time_step"].to_numpy(),
+        "Actual": y_test,
+        "No adaptation": baseline_pred,
+        "Incremental": inc_pred,
+        "Continual (replay)": cont_pred,
+        "Transfer + fine-tuning": trans_pred,
+    })
+    metrics_df = pd.DataFrame([
+        {"Method": "No adaptation (baseline)", **baseline_metrics},
+        {"Method": "Incremental learning", **inc_metrics},
+        {"Method": "Continual learning (replay)", **cont_metrics},
+        {"Method": "Transfer learning + fine-tuning", **trans_metrics},
+    ])
+    metrics_df["MAE improvement vs baseline (%)"] = (
+        (baseline_metrics["MAE"] - metrics_df["MAE"]) / max(baseline_metrics["MAE"], 1e-9) * 100
+    )
+    return df, metrics_df, pred_df, drift_idx, train_end, adapt_end
 
+if run_button or st.session_state.results is None:
+    try:
+        with st.spinner("Generating data and training comparison models..."):
+            st.session_state.results = run_experiment(
+                n_rows, drift_point_pct, drift_type, noise, batch_size,
+                replay_size, source_similarity, random_seed
+            )
+    except Exception as exc:
+        st.error(f"Could not run the experiment: {exc}")
+        st.stop()
 
-# ---------------------------------------------------------------- 1. automatic setup
-st.title("Model Drift Monitor")
-st.caption("Simulated live data: CSV rows are replayed in time order (not a real production stream).")
-sb = st.sidebar
-sb.header("Data")
-up = sb.file_uploader("Upload a CSV (optional)", type="csv")
-files = sorted({os.path.abspath(f) for f in glob.glob(os.path.join(HERE, "*.csv")) + glob.glob("*.csv")})
-if up is not None:
-    raw, name = read_bytes(up.getvalue()), up.name
-elif files:
-    f = files[0] if len(files) == 1 else sb.selectbox("CSV file", files, format_func=os.path.basename)
-    raw, name = read_path(f, os.path.getmtime(f)), os.path.basename(f)
-else:
-    st.info("Place a CSV next to app.py, or upload one in the sidebar.")
-    st.stop()
+df, metrics_df, pred_df, drift_idx, train_end, adapt_end = st.session_state.results
 
-tcol = find_time(raw)
-target, nums = find_target(raw, tcol)
-if not nums:
-    st.error("No numeric column found to predict.")
-    st.stop()
-if target is None:
-    target = sb.selectbox("Which column should be predicted?", nums, index=len(nums) - 1)
-feats = pick_features(raw, target, tcol)
-lag = not feats
-sb.caption(f"**File:** {name} ({len(raw):,} rows)  \n**Predicting:** {target}  \n"
-           f"**Time column:** {tcol or 'row order'}  \n**Input columns:** {len(feats) if feats else 'previous value'}")
-
-sig = (name, len(raw), target, tcol)
-if ss.get("sig") != sig:
-    ss.pop("S", None)
-    ss.sig = sig if init_baseline(raw, target, feats, tcol, lag) else None
-    if "S" in ss:
-        ss.pos = 0
-if "S" not in ss:
-    st.stop()
-
-S = ss.S
-d, n_tr, fit_n, tgt = S["d"], S["n_tr"], S["fit_n"], S["target"]
-n_stream = len(d) - n_tr
-batch = max(10, n_stream // 10)
-win = int(np.clip(n_stream // 10, 10, 50))
-if ss.pos == 0:
-    ss.pos = min(batch, n_stream)
-
-# ---------------------------------------------------------------- 4. simulate incoming data
-sb.header("Live simulation")
-if sb.button("Process next batch", type="primary"):
-    ss.pos = min(ss.pos + batch, n_stream)
-if sb.button("Process all rows"):
-    ss.pos = n_stream
-if sb.button("Restart"):
-    ss.pos, ss.result, ss.active, ss.amodel = min(batch, n_stream), None, "Original model", None
-k = ss.pos
-y_all, p_all, xs = d[tgt].values, S["pred"], d["_x"]
-
-# ---------------------------------------------------------------- monitoring numbers
-stream = d.iloc[n_tr:n_tr + k]
-ys, ps = stream[tgt].values, p_all[n_tr:n_tr + k]
-L = np.where(~np.isnan(ys))[0]  # processed rows whose actual value is known
-yl, pl, xl, lab = ys[L], ps[L], stream["_x"].iloc[L], len(L)
-vm = ~np.isnan(y_all[fit_n:n_tr])
-ref_mae = score(y_all[fit_n:n_tr][vm], p_all[fit_n:n_tr][vm], "MAE")
-limit = ref_mae * (1 + DEGRADE_PCT)
-roll = pd.Series(np.abs(yl - pl)).rolling(win).mean().values
-bad = np.where(roll > limit)[0]
-d_rel = int(bad[0]) if len(bad) else None
-onset = max(d_rel - win + 1, 0) if d_rel is not None else None
-
-if lab == 0:
-    status, note = "Not measurable", "No actual values yet — performance can't be measured. Updating requires labeled data."
-elif lab < win:
-    status, note = "Collecting data", f"Need {win} rows with actual values (have {lab})."
-elif d_rel is not None:
-    status, note = "⚠️ Degraded", "Error rose above the allowed limit."
-else:
-    status, note = "✅ Healthy", "Error is within the allowed limit."
-
-cur = score(yl[-win:], pl[-win:], "MAE") if lab else np.nan
-r = ss.get("result")
+# Top-line metrics
+baseline_row = metrics_df.iloc[0]
+best_row = metrics_df.loc[metrics_df["MAE"].idxmin()]
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Records processed", f"{k:,} / {n_stream:,}")
-c2.metric("Current error (MAE)", "—" if lab == 0 else f"{cur:.3g}",
-          delta=None if lab == 0 else f"{(cur / ref_mae - 1) * 100:+.0f}% vs baseline", delta_color="inverse")
-c3.metric("Model status", status)
-c4.metric("Original → Updated (MAE)", "No update yet" if not r else f"{r['base'][0]:.3g} → {r['new'][0]:.3g}")
-(st.warning if lab == 0 else st.info)(note)
-if k - lab and lab:
-    st.caption(f"{k - lab} processed rows have no actual value; they are predicted but not scored.")
+c1.metric("Rows generated", f"{len(df):,}")
+c2.metric("Drift starts at", f"t = {drift_idx:,}")
+c3.metric("Best method (test MAE)", best_row["Method"])
+c4.metric("Best test MAE", f'{best_row["MAE"]:.3f}', f'{best_row["MAE improvement vs baseline"]:.1f}% vs baseline')
 
-# ---------------------------------------------------------------- graphs
-st.subheader("1 · Actual vs Predicted")
-n_show = n_tr + k
-g1 = go.Figure()
-g1.add_scatter(x=xs[:n_show], y=y_all[:n_show], name="Actual", line=dict(color="#444", width=1))
-g1.add_scatter(x=xs[:n_show], y=p_all[:n_show], name="Predicted", line=dict(color="#1f77b4", width=1))
-if ss.amodel is not None:
-    g1.add_scatter(x=stream["_x"], y=predict(ss.amodel, stream), name="Updated model",
-                   line=dict(color="#2ca02c", width=1))
-g1.add_vrect(x0=xs.iloc[0], x1=xs.iloc[n_tr - 1], fillcolor="#1f77b4", opacity=0.10, line_width=0, layer="below")
-if d_rel is not None:
-    g1.add_vrect(x0=xl.iloc[onset], x1=xs.iloc[n_show - 1], fillcolor="#d62728", opacity=0.10, line_width=0, layer="below")
-    g1.add_scatter(x=[xl.iloc[d_rel]], y=[yl[d_rel]], mode="markers", name="Degradation detected",
-                   marker=dict(color="red", size=11, symbol="x"))
-g1.update_layout(height=340, margin=dict(t=10, b=10), legend=dict(orientation="h"), yaxis_title=tgt)
-st.plotly_chart(g1, width="stretch")
-st.caption("Blue = initial training period · Red = after degradation.")
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Overview", "Model comparison", "Data & drift", "How to interpret"
+])
 
-st.subheader("2 · Model Performance Over Time")
-g2 = go.Figure()
-g2.add_scatter(x=xl, y=roll, name="Recent error (MAE)", line=dict(color="#1f77b4"))
-g2.add_hline(y=limit, line_dash="dash", line_color="red", annotation_text="Allowed limit")
-g2.add_hline(y=ref_mae, line_dash="dot", line_color="green", annotation_text="Baseline")
-if d_rel is not None:
-    g2.add_vrect(x0=xl.iloc[onset], x1=xl.iloc[-1], fillcolor="#d62728", opacity=0.10, line_width=0, layer="below")
-    g2.add_scatter(x=[xl.iloc[d_rel]], y=[roll[d_rel]], mode="markers", name="Degradation detected",
-                   marker=dict(color="red", size=12, symbol="x"))
-g2.update_layout(height=300, margin=dict(t=10, b=10), legend=dict(orientation="h"), yaxis_title="MAE")
-st.plotly_chart(g2, width="stretch")
+with tab1:
+    st.subheader("What happens around drift?")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["time_step"], y=df["target"], mode="lines", name="Actual target",
+        line=dict(width=1.5)
+    ))
+    fig.add_vline(x=drift_idx, line_dash="dash", line_color="red",
+                  annotation_text="Drift begins", annotation_position="top")
+    fig.add_vline(x=adapt_end, line_dash="dot", line_color="green",
+                  annotation_text="Test period begins", annotation_position="top")
+    fig.update_layout(
+        xaxis_title="Time step", yaxis_title="Target value",
+        height=420, legend_title="Series", margin=dict(l=20, r=20, t=40, b=20)
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.markdown(
+        f"**Timeline:** initial training ends at step `{train_end}`; drift begins at `{drift_idx}`; "
+        f"adaptation data ends at `{adapt_end}`; the final test uses later unseen rows."
+    )
+    st.subheader("Key result")
+    st.write(
+        f"On the held-out post-drift test period, **{best_row['Method']}** achieved the lowest "
+        f"MAE ({best_row['MAE']:.3f}) in this simulation. Results depend on the generated data "
+        "and settings; they are not a universal ranking of the methods."
+    )
 
-st.subheader("3 · Data Drift")
-if k < 20:
-    st.info("Process at least 20 records to check for data drift.")
-else:
-    base, recent = d.iloc[:n_tr], d.iloc[n_tr + max(k - 100, 0):n_tr + k]
-    ps_ = pd.Series({f: psi(base[f], recent[f]) for f in S["feats"]}).dropna().sort_values(ascending=False).head(12)
-    g3 = go.Figure(go.Bar(x=ps_.index, y=ps_.values,
-                          marker_color=["#d62728" if v > PSI_LIMIT else "#1f77b4" for v in ps_.values]))
-    g3.add_hline(y=PSI_LIMIT, line_dash="dash", line_color="red")
-    g3.update_layout(height=280, margin=dict(t=10, b=10), yaxis_title="Shift score (PSI)")
-    st.plotly_chart(g3, width="stretch")
-    shifted = ps_[ps_ > PSI_LIMIT].index.tolist()
-    st.caption(("Incoming data differs from baseline for: " + ", ".join(shifted)) if shifted
-               else "Incoming data looks similar to baseline.")
-    st.caption("A data shift alone does not prove the model is worse — check graph 2.")
+with tab2:
+    st.subheader("Performance on unseen post-drift data")
+    display_metrics = metrics_df.copy()
+    for col in ["MAE", "RMSE", "MAE improvement vs baseline (%)"]:
+        display_metrics[col] = display_metrics[col].map(lambda x: f"{x:.3f}")
+    st.dataframe(display_metrics, use_container_width=True, hide_index=True)
+    metric_choice = st.radio("Metric to chart", ["MAE", "RMSE"], horizontal=True)
+    fig_bar = px.bar(
+        metrics_df, x="Method", y=metric_choice, color="Method",
+        title=f"{metric_choice} on held-out post-drift data",
+        text_auto=".3f"
+    )
+    fig_bar.update_layout(showlegend=False, xaxis_title="", yaxis_title=metric_choice, height=420)
+    st.plotly_chart(fig_bar, use_container_width=True)
+    st.caption("Lower MAE/RMSE is better. All methods are evaluated on the same later test period.")
 
-# ---------------------------------------------------------------- 3. update model
-st.header("Update Model")
-if lab == 0:
-    st.info("Model updating needs actual target values (labels). None are available yet.")
-    st.stop()
-opt = st.radio("Training data", OPTIONS, captions=[
-    "Fresh model on recent labeled data", "Fresh model on original + recent labeled data",
-    "Continue training the current model on recent data"])
+    st.subheader("Actual vs predicted")
+    chosen_methods = st.multiselect(
+        "Choose prediction series",
+        ["No adaptation", "Incremental", "Continual (replay)", "Transfer + fine-tuning"],
+        default=["No adaptation", "Incremental", "Continual (replay)", "Transfer + fine-tuning"]
+    )
+    plot_df = pred_df.melt(
+        id_vars=["time_step", "Actual"],
+        value_vars=chosen_methods,
+        var_name="Method", value_name="Prediction"
+    )
+    fig_line = go.Figure()
+    fig_line.add_trace(go.Scatter(
+        x=pred_df["time_step"], y=pred_df["Actual"], mode="lines",
+        name="Actual", line=dict(width=3, color="#222222")
+    ))
+    for method in chosen_methods:
+        fig_line.add_trace(go.Scatter(
+            x=pred_df["time_step"], y=pred_df[method], mode="lines", name=method
+        ))
+    fig_line.update_layout(
+        xaxis_title="Time step", yaxis_title="Target",
+        height=480, margin=dict(l=20, r=20, t=30, b=20)
+    )
+    st.plotly_chart(fig_line, use_container_width=True)
 
-# recent labeled data: from the degradation point if detected, otherwise the latest rows
-start = onset if d_rel is not None else max(lab - 4 * win, 0)
-n_ev = int((lab - start) * EVAL_FRAC)
-gap = 1 if lag else 0  # skip a row when the lag feature links neighbours
-tr_end, ev_s = lab - n_ev - gap, lab - n_ev
-dl = d.iloc[n_tr + L]  # labeled stream rows
-ready = tr_end - start >= 20 and n_ev >= 10
-if ready:
-    new, ev = dl.iloc[start:tr_end], dl.iloc[ev_s:lab]
-    n_train = len(new) + (int(d.iloc[:n_tr][tgt].notna().sum()) if opt == "Use Old + New Data" else 0)
-    st.caption(f"Training rows: {n_train} · Unseen evaluation rows: {len(ev)}")
-else:
-    st.info("Not enough recent labeled data yet — keep processing records.")
+with tab3:
+    st.subheader("Generated sensor data")
+    st.dataframe(df.head(30), use_container_width=True, hide_index=True)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        feature = st.selectbox("Feature distribution", FEATURES)
+        fig_hist = px.histogram(
+            df, x=feature, color="period", barmode="overlay", opacity=0.65,
+            title=f"{feature} before vs after drift"
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+    with col_b:
+        corr = df[FEATURES + ["target"]].corr(numeric_only=True)
+        fig_corr = px.imshow(corr, text_auto=".2f", aspect="auto", title="Feature/target correlation")
+        st.plotly_chart(fig_corr, use_container_width=True)
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download simulated sensor data (CSV)",
+        data=csv,
+        file_name="simulated_sensor_drift.csv",
+        mime="text/csv"
+    )
 
-if st.button("Update and Compare Model", type="primary", disabled=not ready):
-    if opt == "Update Existing Model":
-        model = copy.deepcopy(S["model"])  # original stays untouched
-        Xn, yn = make_X(new), scaled_y(new[tgt])
-        for _ in range(3):
-            model.partial_fit(Xn, yn)
-    else:
-        tr = new
-        if opt == "Use Old + New Data":
-            old = d.iloc[:n_tr]
-            tr = pd.concat([old[old[tgt].notna()], new])
-        model = SGDRegressor(random_state=0).fit(make_X(tr), scaled_y(tr[tgt]))
-    y_ev, p_old, p_new = ev[tgt].values, pl[ev_s:lab], predict(model, ev)
-    base_s = (score(y_ev, p_old, "MAE"), score(y_ev, p_old, "RMSE"))
-    new_s = (score(y_ev, p_new, "MAE"), score(y_ev, p_new, "RMSE"))
-    passed = new_s[0] <= base_s[0] * (1 - MIN_GAIN) and new_s[1] <= base_s[1]
-    ss.result = dict(opt=opt, base=base_s, new=new_s, passed=passed, n_eval=len(ev))
-    if passed:  # promote only after passing evaluation
-        ss.active, ss.amodel = opt, model
-    st.rerun()
+with tab4:
+    st.subheader("What each method means in this app")
+    st.markdown("""
+    - **No adaptation:** the original model is left unchanged after drift.
+    - **Incremental learning:** the model is updated sequentially with post-drift labeled batches.
+    - **Continual learning (replay):** the model is updated with new batches mixed with selected examples from its old training data. Replay is a simple continual-learning strategy; it is not the only one.
+    - **Transfer learning + fine-tuning:** the model first learns from a related synthetic source machine/task, then adapts to target-machine data.
 
-r = ss.get("result")
-if r:
-    b, n_ = r["base"], r["new"]
-    if r["passed"]:
-        st.success(f"Improved — the updated model ({r['opt']}) is now in use.")
-    elif n_[0] > b[0]:
-        st.error("Worse — the original model is kept.")
-    else:
-        st.warning("No meaningful improvement — the original model is kept.")
-    m1, m2 = st.columns(2)
-    m1.metric("MAE (updated)", f"{n_[0]:.3g}", delta=f"{n_[0] - b[0]:+.3g} vs original", delta_color="inverse")
-    m2.metric("RMSE (updated)", f"{n_[1]:.3g}", delta=f"{n_[1] - b[1]:+.3g} vs original", delta_color="inverse")
-    st.subheader("4 · Model Comparison")
-    g4 = go.Figure()
-    g4.add_bar(x=["MAE", "RMSE"], y=list(b), name="Original", marker_color="#888")
-    g4.add_bar(x=["MAE", "RMSE"], y=list(n_), name="Updated", marker_color="#2ca02c" if r["passed"] else "#d62728")
-    g4.update_layout(barmode="group", height=300, margin=dict(t=10, b=10), legend=dict(orientation="h"))
-    st.plotly_chart(g4, width="stretch")
-    st.caption(f"Both models scored on the same {r['n_eval']} unseen rows that were never used for training.")
+    **Fairness note:** the model architecture is kept the same for all strategies, but the training histories differ by design. This is an educational comparison, not a rigorous benchmark. Repeat experiments with several seeds and use a realistic dataset before drawing conclusions.
+
+    **Label note:** supervised updates use the known synthetic target values. In a real live system, actual outcomes may arrive late. Do not use the model's own predictions as if they were ground-truth labels.
+
+    **Operational note:** continue ingesting live data during adaptation, but validate the candidate model before replacing the deployed model. If degraded predictions are unsafe, use a validated fallback or operational safeguard.
+    """)
+    st.subheader("Download results")
+    st.download_button(
+        "Download comparison metrics (CSV)",
+        data=metrics_df.to_csv(index=False).encode("utf-8"),
+        file_name="learning_method_comparison.csv",
+        mime="text/csv"
+    )
+    st.download_button(
+        "Download held-out predictions (CSV)",
+        data=pred_df.to_csv(index=False).encode("utf-8"),
+        file_name="post_drift_predictions.csv",
+        mime="text/csv"
+    )
+
+st.divider()
+st.caption("Educational demo • Synthetic data • Streamlit + Plotly + scikit-learn")
