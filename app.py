@@ -274,7 +274,11 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Rows generated", f"{len(df):,}")
 c2.metric("Drift starts at", f"t = {drift_idx:,}")
 c3.metric("Best method (test MAE)", best_row["Method"])
-c4.metric("Best test MAE", f'{best_row["MAE"]:.3f}', f'{best_row["MAE improvement vs baseline"]:.1f}% vs baseline')
+c4.metric(
+    "Best test MAE",
+    f'{best_row["MAE"]:.3f}',
+    f'{best_row["MAE improvement vs baseline (%)"]:.1f}% vs baseline'
+)
 
 tab1, tab2, tab3, tab4 = st.tabs([
     "Overview", "Model comparison", "Data & drift", "How to interpret"
