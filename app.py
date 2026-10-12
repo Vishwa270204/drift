@@ -1,25 +1,3 @@
-Pasted text(1).txt
-Document
-
-Full code update: Apply these UI changes to your complete app.py while preserving the existing model-training and drift-detection logic.
-
-Updated the complete app.py while preserving the existing Hoeffding Adaptive Tree training, drift detection, candidate evaluation, and model-update logic.
-
-Download the updated app.py
-
-Changes applied
-
-Moved configuration from the sidebar to the main page.
-
-Simplified the dashboard title and instructions.
-
-Added a stable Plotly chart identity to help preserve chart state across reruns.
-
-Kept the existing drift chart, metrics, model history, and event log.
-
-Preserved the existing model-update decision process.
-
-Important: The dashboard still processes data in batches and uses manual controls for model updates. The chart identity setting does not guarantee a completely flicker-free animation or continuous, row-by-row streaming. Those behaviors would require additional UI changes.
 
 """
 Model Drift Dashboard — Hoeffding Adaptive Tree edition
