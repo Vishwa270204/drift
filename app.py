@@ -1,337 +1,226 @@
-"""Live Drift Dashboard - one Hoeffding Adaptive Tree, built from scratch.
-
-    streamlit run hat_drift_dashboard.py
-
-How it works
-------------
-* ONE model: river's Hoeffding Adaptive Tree (classifier or regressor). It adapts internally: every node
-  watches its own error with ADWIN and grows an alternate subtree when it degrades.
-* Training strategy: prequential "test-then-train" with an optional label delay.
-    1. every incoming row is PREDICTED first (this is what gets scored),
-    2. its label is released to the model `label delay` rows later and the tree learns from it one row at a time.
-  The first `warm-up` rows are used for training only (no scoring, no detection).
-* Drift detection: a separate ADWIN watches the stream of per-row prediction errors. When its window splits
-  into two significantly different halves, a drift event is logged. The tree's own internal reactions
-  (alternate subtrees created / swapped in) are tracked on a second chart.
-* The charts update by themselves while streaming is running; no clicking needed after Start.
-"""
-import io
+import time
 from collections import deque
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from plotly.subplots import make_subplots
-from river import drift, tree
+from river import drift, metrics, stats, tree
 
-MAX_POINTS = 1500          # points drawn per chart (older history is thinned out)
-MAX_MARKERS = 40           # drift markers drawn at most
-SENS = {"Low (fewer alerts)": 1e-4, "Medium": 2e-3, "High (more alerts)": 2e-2}   # ADWIN delta
+st.set_page_config(page_title="Model Drift Dashboard", layout="wide")
+
+TASKS = ["Regression", "Classification"]
+WARMUP, WINDOW, REPLAY, PLOT_WIN = 30, 200, 100, 50
+STATUS = {
+    "Normal": "🟢 Normal",
+    "Drift Detected": "🔴 Drift Detected",
+    "Retraining": "🟠 Retraining",
+}
 
 
-# ------------------------------------------------------------------ data
-@st.cache_data(show_spinner="Reading CSV...")
-def read_csv(data):
-    for enc in ("utf-8-sig", "latin-1"):
+def synthetic(task, n=3000):
+    rng = np.random.default_rng(7)
+    X = rng.normal(size=(n, 5))
+    seg = np.minimum(np.arange(n) // 1000, 2)
+    if task == "Regression":
+        W = np.array([[3, -2, 1, 0, 0], [-3, 2, 0, 2, 0], [0, 1, -3, 0, 3]], float)
+        y = (X * W[seg]).sum(axis=1) + 0.3 * rng.normal(size=n)
+    else:
+        W = np.array([[1, 1, 0, 0, 0], [-1, 1, 0, 0, 0], [0, 0, 1, -1, 0]], float)
+        y = ((X * W[seg]).sum(axis=1) > 0).astype(int)
+        y = np.where(rng.random(n) < 0.05, 1 - y, y)
+    return [f"f{i}" for i in range(5)], X.tolist(), y.tolist()
+
+
+def load_csv(file, task):
+    df = pd.read_csv(file).replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
+    if df.shape[1] < 2:
+        raise ValueError("need at least one feature column and a target column")
+    df.columns = df.columns.astype(str)
+    target = df.columns[-1]
+    raw = df[target]
+    if task == "Regression":
+        y = pd.to_numeric(raw, errors="coerce")
+        if raw.notna().sum() == 0 or y.notna().sum() / raw.notna().sum() < 0.9:
+            raise ValueError("target is not numeric; use Classification")
+    else:
+        y = raw
+    X = df.drop(columns=target).apply(pd.to_numeric, errors="coerce")
+    X = X.dropna(axis=1, how="all")
+    if X.shape[1] == 0:
+        raise ValueError("no usable numeric feature columns")
+    X = X.fillna(X.median()).fillna(0.0)
+    ok = y.notna()
+    X, y = X[ok], y[ok]
+    if task == "Classification":
+        y = y.astype(str)
+        if y.nunique() < 2:
+            raise ValueError("target needs at least two classes")
+        if y.nunique() > 50:
+            raise ValueError("target has too many classes; use Regression")
+    if len(y) < 50:
+        raise ValueError("need at least 50 valid rows")
+    return list(X.columns), X.to_numpy(float).tolist(), y.tolist()
+
+
+def new_model(task):
+    if task == "Regression":
+        return tree.HoeffdingAdaptiveTreeRegressor(grace_period=50, seed=0)
+    return tree.HoeffdingAdaptiveTreeClassifier(grace_period=50, seed=0)
+
+
+def new_detector():
+    return drift.ADWIN(delta=0.002)
+
+
+def fresh():
+    task = st.session_state.get("task", TASKS[0])
+    file = st.session_state.get("file")
+    msg = ""
+    if file is None:
+        cols, X, y = synthetic(task)
+    else:
         try:
-            out = pd.read_csv(io.BytesIO(data), encoding=enc)
-            if out.shape[1] <= 1:
-                out = pd.read_csv(io.BytesIO(data), encoding=enc, sep=None, engine="python")
-            return out
-        except UnicodeDecodeError:
-            continue
-    raise ValueError("Could not read the file as CSV.")
-
-
-def demo_stream(n=12000, seed=0):
-    """Built-in demo: 3 numeric features. Data drift at 40% (feature means shift), concept drift at 70%
-    (the labelling rule changes)."""
-    r = np.random.default_rng(seed)
-    a, b, c = r.normal(0, 1, n), r.normal(0, 1, n), r.normal(0, 1, n)
-    d1, d2 = int(n * 0.4), int(n * 0.7)
-    a[d1:] += 1.5
-    b[d1:] *= 2.0
-    y = np.zeros(n, dtype=int)
-    y[:d1] = (a[:d1] + 0.5 * b[:d1] > 0).astype(int)
-    y[d1:d2] = (a[d1:d2] + 0.5 * b[d1:d2] > 1.5).astype(int)
-    y[d2:] = (a[d2:] - 0.5 * b[d2:] < 1.5).astype(int)          # rule changed: concept drift
-    flip = r.random(n) < 0.03                                    # 3% label noise
-    y = np.where(flip, 1 - y, y)
-    return pd.DataFrame({"feat_a": a, "feat_b": b, "feat_c": c, "label": y})
-
-
-def pick_features(df, exclude):
-    num, cat = [], []
-    for col in df.columns:
-        if col in exclude:
-            continue
-        s, n = df[col], df[col].notna().sum()
-        if n == 0 or s.nunique() <= 1:
-            continue
-        if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
-            if not (s.nunique() / n > 0.99 and bool(np.all(np.mod(s.dropna(), 1) == 0))):   # skip id-like
-                num.append(col)
-        elif s.nunique() <= 50:
-            cat.append(col)
-    return num, cat
-
-
-def to_rows(df, num, cat):
-    """List of feature dicts (river format). Missing numeric values are simply left out of the dict."""
-    parts = {}
-    for col in num:
-        parts[col] = pd.to_numeric(df[col], errors="coerce").to_numpy(float)
-    for col in cat:
-        parts[col] = np.where(df[col].notna(), df[col].astype(str), "(missing)")
-    frame = pd.DataFrame(parts)
-    rows = frame.to_dict("records")
-    return [{k: v for k, v in r.items() if not (isinstance(v, float) and v != v)} for r in rows]
-
-
-def label_str(s):
-    s = pd.Series(s)
-    if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
-        v = s.to_numpy(float)
-        if len(v) and np.all(np.isfinite(v)) and np.all(np.mod(v, 1) == 0):
-            return v.astype(np.int64).astype(str)
-    return s.astype(str).to_numpy()
-
-
-# ------------------------------------------------------------------ session
-def make_model(task, cfg):
-    kw = dict(grace_period=cfg["grace"], delta=cfg["tree_delta"], max_depth=cfg["max_depth"] or None,
-              seed=cfg["seed"])
-    if task == "classification":
-        return tree.HoeffdingAdaptiveTreeClassifier(**kw)
-    return tree.HoeffdingAdaptiveTreeRegressor(**kw)
-
-
-def init_session(df, target, tcol, task, cfg):
-    d = df.copy()
-    if tcol not in (None, "(row order)"):
-        tv = pd.to_numeric(d[tcol], errors="coerce") if pd.api.types.is_numeric_dtype(d[tcol]) \
-            else pd.to_datetime(d[tcol], errors="coerce", utc=True)
-        d = d.loc[tv.notna()].assign(_t=tv[tv.notna()]).sort_values("_t", kind="stable").drop(columns="_t")
-    d = d[d[target].notna()]
-    if task == "regression":
-        yv = pd.to_numeric(d[target], errors="coerce")
-        d = d.loc[np.isfinite(yv)]
-        y = yv[np.isfinite(yv)].to_numpy(float)
-    d = d.reset_index(drop=True)
-    if task == "classification":
-        y = label_str(d[target])
-    if len(d) < cfg["warm"] + 100:
-        raise ValueError(f"Need at least {cfg['warm'] + 100} labelled rows (warm-up {cfg['warm']} + 100 to stream).")
-    num, cat = pick_features(d.iloc[:cfg["warm"]], {target, tcol})
-    if not (num or cat):
-        raise ValueError("No usable feature columns were found.")
+            file.seek(0)
+            cols, X, y = load_csv(file, task)
+        except Exception as e:
+            msg = f"CSV rejected: {e}. Using synthetic stream."
+            cols, X, y = synthetic(task)
+    metric = metrics.MAE() if task == "Regression" else metrics.Accuracy()
     return dict(
-        rows=to_rows(d, num, cat), y=y, N=len(y), task=task, cfg=cfg, features=num + cat,
-        model=make_model(task, cfg), adwin=drift.ADWIN(delta=cfg["adwin_delta"]),
-        i=0, running=False, pending=deque(), win=deque(), win_sum=0.0, err_sum=0.0, n_scored=0,
-        xs=[], roll=[], cum=[], nodes=[], switches=[], events=[], drift_rows=[],
-        y_n=0, y_mean=0.0, y_m2=0.0, last_sw=0, last_alt=0, default=None,
+        task=task, cols=cols, X=X, y=y, i=0, msg=msg,
+        model=new_model(task), det=new_detector(),
+        metric=metrics.Rolling(metric, WINDOW), var=stats.Var(),
+        buf=deque(maxlen=REPLAY), win=deque(maxlen=PLOT_WIN),
+        xs=[], ys=[], drifts=[], since=0, status="Normal",
+        pending=False, running=False,
     )
 
 
-def norm_error(S, y, p):
-    """Per-row error in roughly [0, 1] so ADWIN sees a comparable signal for both tasks."""
-    if S["task"] == "classification":
-        return 0.0 if (p is not None and p == y) else 1.0
-    S["y_n"] += 1                                     # running std of the target (Welford)
-    dlt = y - S["y_mean"]
-    S["y_mean"] += dlt / S["y_n"]
-    S["y_m2"] += dlt * (y - S["y_mean"])
-    sd = (S["y_m2"] / max(S["y_n"] - 1, 1)) ** 0.5 or 1.0
-    raw = abs(y - (p if p is not None else S["y_mean"]))
-    S["raw_sum"] = S.get("raw_sum", 0.0) + raw
-    return min(raw / (3 * sd), 1.0)
+def restart():
+    st.session_state.s = fresh()
 
 
-def tree_stats(m):
-    def g(name, default=0):
-        try:
-            v = getattr(m, name)
-            return v() if callable(v) else v
-        except Exception:
-            return default
-    return dict(nodes=g("n_nodes"), leaves=g("n_leaves"), depth=g("height"),
-                alt=g("n_alternate_trees"), sw=g("n_switch_alternate_trees"), pruned=g("n_pruned_alternate_trees"))
+def toggle():
+    s = st.session_state.s
+    if s["running"]:
+        s["running"] = False
+        return
+    if s["i"] >= len(s["y"]):
+        st.session_state.s = s = fresh()
+    s["running"] = True
 
 
-def step_rows(S, n):
-    """Process up to n rows: test-then-train with label delay, ADWIN on the error stream."""
-    cfg, m = S["cfg"], S["model"]
-    for _ in range(n):
-        i = S["i"]
-        if i >= S["N"]:
-            S["running"] = False
-            return
-        x, y = S["rows"][i], S["y"][i]
-        S["i"] = i + 1
-        if i >= cfg["warm"]:
-            p = m.predict_one(x)
-            e = norm_error(S, y, p)
-            S["win"].append(e)
-            S["win_sum"] += e
-            if len(S["win"]) > cfg["roll"]:
-                S["win_sum"] -= S["win"].popleft()
-            S["err_sum"] += e
-            S["n_scored"] += 1
-            S["adwin"].update(e)
-            if S["adwin"].drift_detected:
-                st_ = tree_stats(m)
-                S["drift_rows"].append(i)
-                S["events"].append({"Row": i, "Rolling error": round(S["win_sum"] / len(S["win"]), 4),
-                                    "Tree nodes": st_["nodes"], "Alternate trees": st_["alt"],
-                                    "Subtree swaps so far": st_["sw"]})
-            S["pending"].append((x, y))
-            while len(S["pending"]) > cfg["delay"]:       # labels arrive `delay` rows late
-                m.learn_one(*S["pending"].popleft())
-            if S["n_scored"] % cfg["rec"] == 0:
-                st_ = tree_stats(m)
-                S["xs"].append(i)
-                S["roll"].append(S["win_sum"] / len(S["win"]))
-                S["cum"].append(S["err_sum"] / S["n_scored"])
-                S["nodes"].append(st_["nodes"])
-                S["switches"].append(st_["sw"])
-        else:
-            m.learn_one(x, y)                              # warm-up: train only
+def detect(det, value):
+    det.update(value)
+    return bool(getattr(det, "drift_detected", getattr(det, "change_detected", False)))
 
 
-# ------------------------------------------------------------------ charts
-def thin(a, k=MAX_POINTS):
-    if len(a) <= k:
-        return np.asarray(a)
-    return np.asarray(a)[np.linspace(0, len(a) - 1, k).astype(int)]
+def retrain(s):
+    model = new_model(s["task"])
+    for bx, by in s["buf"]:
+        model.learn_one(bx, by)
+    s["model"], s["det"], s["since"] = model, new_detector(), 0
+    s["status"], s["pending"] = "Retraining", False
 
 
-def live_chart(S, true_drifts=()):
-    unit = "Error rate" if S["task"] == "classification" else "Normalised abs. error"
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.68, 0.32], vertical_spacing=0.06,
-                        subplot_titles=(f"{unit} of the live predictions", "Tree size and subtree swaps"))
-    if S["xs"]:
-        xs = thin(S["xs"])
-        fig.add_trace(go.Scatter(x=xs, y=thin(S["roll"]), mode="lines", name=f"Rolling ({S['cfg']['roll']} rows)",
-                                 line=dict(color="#1f6fb2", width=2)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=xs, y=thin(S["cum"]), mode="lines", name="Cumulative",
-                                 line=dict(color="#9e9e9e", dash="dot")), row=1, col=1)
-        fig.add_trace(go.Scatter(x=xs, y=thin(S["nodes"]), mode="lines", name="Tree nodes",
-                                 line=dict(color="#00897b")), row=2, col=1)
-        fig.add_trace(go.Scatter(x=xs, y=thin(S["switches"]), mode="lines", name="Subtree swaps (cumulative)",
-                                 line=dict(color="#e08a00", shape="hv")), row=2, col=1)
-    for r in S["drift_rows"][-MAX_MARKERS:]:
-        fig.add_vline(x=r, line_color="#c62828", line_width=1, opacity=0.6)
-    for r in true_drifts:
-        fig.add_vline(x=r, line_color="#6a1b9a", line_dash="dash", annotation_text="true drift",
-                      annotation_position="top left")
-    fig.update_xaxes(range=[S["cfg"]["warm"], S["N"]], title_text="Row in stream", row=2, col=1)
-    fig.update_layout(height=560, margin=dict(t=40, b=40, l=50, r=20), legend=dict(orientation="h", y=-0.14),
-                      uirevision="live")
-    st.plotly_chart(fig, use_container_width=True)
+def step(s):
+    x = dict(zip(s["cols"], s["X"][s["i"]]))
+    y = s["y"][s["i"]]
+    reg = s["task"] == "Regression"
+    p = s["model"].predict_one(x)
+    if p is None:
+        p = "?"
+    s["metric"].update(y, p)
+    if reg:
+        s["var"].update(y)
+        sd = s["var"].get() ** 0.5
+        score = min(abs(y - p) / sd, 1.0) if sd > 0 else 1.0
+    else:
+        score = float(p != y)
+    s["i"] += 1
+    s["since"] += 1
+    s["win"].append(score)
+    s["xs"].append(s["i"])
+    s["ys"].append(sum(s["win"]) / len(s["win"]))
+    s["buf"].append((x, y))
+    if s["since"] > WARMUP and detect(s["det"], score):
+        s["drifts"].append((s["i"], s["ys"][-1]))
+        s["status"], s["pending"] = "Drift Detected", True
+        return
+    s["model"].learn_one(x, y)
+    if s["status"] == "Retraining" and s["since"] >= WARMUP:
+        s["status"] = "Normal"
 
 
-def live_panel(S, true_drifts):
-    """Runs repeatedly by itself while streaming; processes a chunk of rows, then redraws."""
-    if S["running"]:
-        step_rows(S, S["cfg"]["speed"])
-        if not S["running"]:
-            st.rerun()                                     # finished: refresh buttons / status
-    scored = S["n_scored"]
-    ts = tree_stats(S["model"])
-    c = st.columns(5)
-    c[0].metric("Rows streamed", f"{S['i']:,} / {S['N']:,}")
-    c[1].metric("Rolling error", f"{S['win_sum'] / len(S['win']):.3f}" if S["win"] else "-")
-    c[2].metric("Overall error", f"{S['err_sum'] / scored:.3f}" if scored else "-")
-    c[3].metric("Drifts detected", len(S["drift_rows"]))
-    c[4].metric("Tree nodes / depth", f"{ts['nodes']} / {ts['depth']}")
-    st.progress(min(S["i"] / S["N"], 1.0))
-    if S["i"] < S["cfg"]["warm"]:
-        st.caption(f"Warm-up: training on the first {S['cfg']['warm']:,} rows (no scoring yet).")
-    live_chart(S, true_drifts)
-    if S["events"]:
-        st.subheader("Drift events")
-        st.dataframe(pd.DataFrame(S["events"]).iloc[::-1], hide_index=True, use_container_width=True)
+def figure(s):
+    k = max(1, len(s["xs"]) // 2000)
+    dx = [v for d, _ in s["drifts"] for v in (d, d, None)]
+    dy = [v for _ in s["drifts"] for v in (0, 1, None)]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=s["xs"][::k], y=s["ys"][::k], mode="lines",
+        line=dict(color="#1f77b4", width=2), name="Error"))
+    fig.add_trace(go.Scatter(
+        x=dx, y=dy, mode="lines", line=dict(color="rgba(214,39,40,0.6)", width=1.5, dash="dash"),
+        hoverinfo="skip", name="Drift"))
+    fig.add_trace(go.Scatter(
+        x=[d for d, _ in s["drifts"]], y=[v for _, v in s["drifts"]], mode="markers",
+        marker=dict(color="#d62728", size=10, symbol="diamond"), name="Drift point"))
+    fig.update_layout(
+        height=380, margin=dict(l=10, r=10, t=10, b=10), showlegend=False,
+        template="plotly_white", uirevision="keep", hovermode="x",
+        xaxis=dict(range=[0, len(s["y"])], title="Samples"),
+        yaxis=dict(range=[0, 1.02], title=f"Rolling error (last {PLOT_WIN})"),
+    )
+    return fig
 
 
-# ------------------------------------------------------------------ app
-def sidebar():
-    with st.sidebar:
-        st.header("Stream")
-        up = st.file_uploader("Upload a CSV (rows in time order)", type=["csv"])
-        true_drifts = ()
-        if up is None:
-            st.caption("No file: using the built-in demo stream (data drift at 40%, concept drift at 70%).")
-            df = demo_stream()
-            target, true_drifts = "label", (int(len(df) * 0.4), int(len(df) * 0.7))
-            tcol = "(row order)"
-        else:
-            try:
-                df = read_csv(up.getvalue())
-            except Exception as exc:
-                st.error(str(exc))
-                return None
-            target = st.selectbox("Target column", df.columns, index=len(df.columns) - 1)
-            tcol = st.selectbox("Time column (optional)", ["(row order)"] + [c for c in df.columns if c != target])
-        guess = "regression" if (pd.api.types.is_numeric_dtype(df[target]) and df[target].nunique() > 10) \
-            else "classification"
-        task = st.radio("Task", ["classification", "regression"], horizontal=True,
-                        index=["classification", "regression"].index(guess))
-        st.header("Streaming")
-        speed = int(st.slider("Rows per refresh", 1, 500, 40))
-        refresh = st.slider("Refresh interval (seconds)", 0.1, 2.0, 0.3, 0.1)
-        st.header("Training strategy")
-        warm = int(st.number_input("Warm-up rows (train only)", 50, 100000, 500, step=50))
-        delay = int(st.number_input("Label delay (rows)", 0, 5000, 0,
-                                    help="Labels reach the model this many rows after the prediction."))
-        st.header("Drift detection")
-        sens = st.selectbox("Sensitivity", list(SENS), index=1)
-        roll = int(st.number_input("Rolling window (rows)", 20, 5000, 200, step=20))
-        with st.expander("Tree settings"):
-            grace = int(st.number_input("Grace period", 20, 2000, 200, step=20))
-            tree_delta = st.select_slider("Split confidence delta", [1e-3, 1e-5, 1e-7, 1e-9], value=1e-7)
-            max_depth = int(st.number_input("Max depth (0 = unlimited)", 0, 50, 0))
-            seed = int(st.number_input("Seed", 0, 10000, 42))
-        cfg = dict(speed=speed, refresh=refresh, warm=warm, delay=delay, adwin_delta=SENS[sens], roll=roll,
-                   grace=grace, tree_delta=float(tree_delta), max_depth=max_depth, seed=seed,
-                   rec=max(1, speed // 4))
-        if st.button("Load stream with these settings", type="primary"):
-            try:
-                st.session_state["S"] = init_session(df, target, tcol, task, cfg)
-                st.session_state["true_drifts"] = true_drifts
-            except ValueError as exc:
-                st.error(str(exc))
-        return cfg
+def render(s, ph):
+    reg = s["task"] == "Regression"
+    val = s["metric"].get()
+    ph["status"].metric("Status", STATUS[s["status"]])
+    ph["n"].metric("Samples processed", f'{s["i"]:,} / {len(s["y"]):,}')
+    ph["d"].metric("Drift count", len(s["drifts"]))
+    ph["m"].metric(
+        f'{"MAE" if reg else "Accuracy"} (last {WINDOW})',
+        f"{val:.3f}" if reg else f"{val:.1%}")
+    cfg = {"displayModeBar": False}
+    try:
+        ph["chart"].plotly_chart(figure(s), width="stretch", config=cfg)
+    except TypeError:
+        ph["chart"].plotly_chart(figure(s), use_container_width=True, config=cfg)
 
 
-def main():
-    st.set_page_config(page_title="Live Drift Dashboard", page_icon="📈", layout="wide")
-    st.title("📈 Live Drift Dashboard · Hoeffding Adaptive Tree")
-    sidebar()
-    S = st.session_state.get("S")
-    if S is None:
-        st.info("Choose settings in the sidebar and click **Load stream with these settings**, then **Start**.")
-        st.stop()
+if "s" not in st.session_state:
+    st.session_state.s = fresh()
+s = st.session_state.s
 
-    done = S["i"] >= S["N"]
-    b = st.columns([1, 1, 1, 5])
-    if b[0].button("▶ Start", type="primary", disabled=S["running"] or done):
-        S["running"] = True
-        st.rerun()
-    if b[1].button("⏸ Pause", disabled=not S["running"]):
-        S["running"] = False
-        st.rerun()
-    if b[2].button("↺ Restart"):
-        st.session_state.pop("S")
-        st.rerun()
-    b[3].markdown(f"**Status:** {'Finished' if done else 'Streaming' if S['running'] else 'Paused'}  ·  "
-                  f"features: {', '.join(S['features'][:8])}{'…' if len(S['features']) > 8 else ''}")
+st.title("Model Drift Detection Dashboard")
 
-    # the fragment re-runs itself every `refresh` seconds while streaming, so the graph fills in automatically
-    run_every = S["cfg"]["refresh"] if S["running"] else None
-    st.fragment(run_every=run_every)(live_panel)(S, st.session_state.get("true_drifts", ()))
+c1, c2, c3, c4 = st.columns([1.2, 2.2, 1.6, 1])
+c1.selectbox("Model type", TASKS, key="task", on_change=restart)
+c2.file_uploader("Upload CSV (optional, last column = target)", type="csv",
+                 key="file", on_change=restart)
+c3.slider("Delay (ms)", 0, 500, 50, 10, key="delay")
+c4.button("⏹ Stop" if s["running"] else "▶ Start", on_click=toggle, type="primary", key="go")
 
+if s["msg"]:
+    st.error(s["msg"])
 
-if __name__ == "__main__":
-    main()
+m1, m2, m3, m4 = st.columns(4)
+ph = {"status": m1.empty(), "n": m2.empty(), "d": m3.empty(), "m": m4.empty(), "chart": st.empty()}
+render(s, ph)
+
+delay = st.session_state.get("delay", 50) / 1000
+while s["running"] and s["i"] < len(s["y"]):
+    if s["pending"]:
+        retrain(s)
+        render(s, ph)
+    step(s)
+    render(s, ph)
+    time.sleep(delay)
+
+if s["running"]:
+    s["running"] = False
+    st.rerun()
