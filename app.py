@@ -407,21 +407,73 @@ m3.metric("Retrains so far", len(S["retrains"]))
 m4.metric("Status", status)
 
 # ------------------------------------------------------------------ main graph
+# ------------------------------------------------------------------
+# Main graph (safe against mismatched monitoring arrays)
+# ------------------------------------------------------------------
 if S["k"]:
     fig = go.Figure()
-    xs = np.arange(1, S["k"] + 1)
-    ver = np.array(S["ver"])
-    for v in range(S["version"] + 1):
-        idx = np.where(ver == v)[0]
-        fig.add_trace(go.Scatter(x=xs[idx], y=np.array(S["errs"])[idx], mode="lines+markers", name=f"Model v{v}"))
-    fig.add_trace(go.Scatter(x=xs, y=S["thr"], mode="lines", name="Drift threshold", line=dict(dash="dash", color="#d1342f")))
+
+    # Convert monitoring history into arrays
+    ver_all = np.asarray(S["ver"])
+    errs_all = np.asarray(S["errs"], dtype=float)
+
+    # Ensure every plotted array has the same length
+    n = min(S["k"], len(ver_all), len(errs_all), len(S["thr"]))
+
+    xs = np.arange(1, n + 1)
+    ver = ver_all[:n]
+    errs = errs_all[:n]
+    thresholds = np.asarray(S["thr"], dtype=float)[:n]
+
+    for v in sorted(np.unique(ver)):
+        idx = np.flatnonzero(ver == v)
+
+        # Safe because idx is generated from the aligned version array
+        fig.add_trace(
+            go.Scatter(
+                x=xs[idx],
+                y=errs[idx],
+                mode="lines+markers",
+                name=f"Model v{v}"
+            )
+        )
+
+    fig.add_trace(
+        go.Scatter(
+            x=xs,
+            y=thresholds,
+            mode="lines",
+            name="Drift threshold",
+            line=dict(dash="dash", color="#d1342f")
+        )
+    )
+
     for r in S["retrains"]:
-        fig.add_vline(x=r["applied"] + 0.5, line_color="#2e9e5b", annotation_text=f"retrain v{r['version']}")
-    if al:
-        fig.add_vline(x=al["start"] + 1, line_color="#d1342f", annotation_text="drift starts")
-    fig.update_layout(title="Model drift: error per incoming batch", xaxis_title="Batch",
-                      yaxis_title="MAE" if S["task"] == "regression" else "Error rate", height=380)
-    st.plotly_chart(fig)
+        batch_x = r["applied"] + 1
+        if 1 <= batch_x <= n:
+            fig.add_vline(
+                x=batch_x,
+                line_color="#2e9e5b",
+                annotation_text=f"Retrain v{r['version']}"
+            )
+
+    if S["alert"] is not None:
+        drift_x = S["alert"]["start"] + 1
+        if 1 <= drift_x <= n:
+            fig.add_vline(
+                x=drift_x,
+                line_color="#d1342f",
+                annotation_text="Drift starts"
+            )
+
+    fig.update_layout(
+        title="Model drift: error per incoming batch",
+        xaxis_title="Batch",
+        yaxis_title="MAE" if S["task"] == "regression" else "Error rate",
+        height=380
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
 
 # ------------------------------------------------------------------ waiting / decision
 if al and al["status"] == "waiting":
