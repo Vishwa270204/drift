@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from river import drift, metrics, stats, tree
+from river import drift, metrics, stats, tree, utils
 
 st.set_page_config(page_title="Model Drift Dashboard", layout="wide")
 
@@ -90,7 +90,7 @@ def fresh():
     return dict(
         task=task, cols=cols, X=X, y=y, i=0, msg=msg,
         model=new_model(task), det=new_detector(),
-        metric=metrics.Rolling(metric, WINDOW), var=stats.Var(),
+        metric=utils.Rolling(metric, window_size=WINDOW), var=stats.Var(),
         buf=deque(maxlen=REPLAY), win=deque(maxlen=PLOT_WIN),
         xs=[], ys=[], drifts=[], since=0, status="Normal",
         pending=False, running=False,
@@ -130,7 +130,7 @@ def step(s):
     reg = s["task"] == "Regression"
     p = s["model"].predict_one(x)
     if p is None:
-        p = "?"
+        p = 0.0 if reg else "?"
     s["metric"].update(y, p)
     if reg:
         s["var"].update(y)
