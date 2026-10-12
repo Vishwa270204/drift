@@ -160,6 +160,55 @@ def sel_loss(m, crit):
     return 1 - m["Recall"] if crit == "Recall of class of interest" else m[crit]
 
 
+# ------------------------------------------------------------------ input (feature) drift: PSI
+PSI_MOD, PSI_SIG, PSI_EPS, PSI_BINS, PSI_WINDOW = 0.10, 0.25, 1e-4, 5, 3   # window = last 3 batches, to reduce noise
+
+
+def feat_counts(s, e):
+    if e[0] == "num":
+        x = s.to_numpy(float)
+        miss = np.isnan(x)
+        return np.append(np.bincount(np.digitize(x[~miss], e[1], right=True), minlength=len(e[1]) + 1), miss.sum())
+    vc = s.value_counts()
+    c = [int(vc.get(level, 0)) for level in e[1]]
+    return np.array(c + [len(s) - sum(c)])          # last bin = categories not seen in the reference
+
+
+def build_spec(Xr, num, cat):
+    """Reference bins (numeric: quantiles; categorical: top-20 levels) and counts, from the reference rows only."""
+    spec = {}
+    for c in num:
+        v = Xr[c].dropna().to_numpy(float)
+        edges = np.unique(np.quantile(v, np.linspace(0, 1, PSI_BINS + 1)[1:-1])) if v.size >= 10 else np.array([])
+        if edges.size:
+            spec[c] = ("num", edges, feat_counts(Xr[c], ("num", edges)))
+    for c in cat:
+        if len(Xr):
+            e = ("cat", list(Xr[c].value_counts().head(20).index))
+            spec[c] = (*e, feat_counts(Xr[c], e))
+    return spec
+
+
+def psi_of(ref, cur):
+    r, c = ref.astype(float), cur.astype(float)
+    if r.sum() == 0 or c.sum() == 0:
+        return np.nan
+    pr, pc = np.clip(r / r.sum(), PSI_EPS, None), np.clip(c / c.sum(), PSI_EPS, None)
+    return float(((pc - pr) * np.log(pc / pr)).sum())
+
+
+def psi_status(v):
+    return "n/a" if v is None or np.isnan(v) else "Stable" if v < PSI_MOD else "Moderate" if v < PSI_SIG else "Significant"
+
+
+def latest_psi(S):
+    vals = {k: v for k, v in (S["psi"][-1] if S["psi"] else {}).items() if not np.isnan(v)}
+    if not vals:
+        return np.nan, "", {}
+    top = max(vals, key=vals.get)
+    return vals[top], top, vals
+
+
 # ------------------------------------------------------------------ data prep
 @st.cache_data(show_spinner="Reading CSV...")
 def read(data):
@@ -239,6 +288,14 @@ def step(S):
     S["thr"].append(S["ref_m"] + S["z"] * S["ref_s"] / np.sqrt(b - a))
     S["ver"].append(S["version"])
     S["k"] = k + 1
+    win = S["X"].iloc[n_tr + max(0, k - PSI_WINDOW + 1) * B:b]           # labels not needed for input drift
+    S["psi"].append({c: psi_of(en[2], feat_counts(win[c], en)) for c, en in S["spec"].items()})
+    mx, top, _ = latest_psi(S)
+    if mx >= PSI_SIG and not S["dflag"]:
+        S["dflag"] = True
+        log(S, "Input drift", f"PSI {mx:.2f} on '{top}'")
+    elif mx < PSI_MOD:
+        S["dflag"] = False
     j = k - S["delay"]
     if j >= 0 and S["ver"][j] == S["version"]:          # ignore batches scored by an earlier model version
         flagged = S["errs"][j] > S["thr"][j]
@@ -356,6 +413,9 @@ def apply_choice(S, name):
         S["model"], S["version"] = new, S["version"] + 1
         S["ref_m"], S["ref_s"] = ref_stats(S["task"], c["errs"][name])   # threshold from the held-out estimate
         S["retrains"].append(dict(version=S["version"], strategy=name, applied=S["k"], start=al["start"]))
+        new_spec = build_spec(Xn, S["num"], S["cat"])           # input-drift reference = the new regime
+        if new_spec:
+            S["spec"], S["dflag"] = new_spec, False
         log(S, "Retrained", f"v{S['version']} = {name} (old {c['n_old']:,} rows, new {c['n_new']:,} rows)")
     else:
         S["snooze_until"] = S["k"] + S["snooze"]
@@ -387,22 +447,14 @@ with st.container(border=True):
     min_rows = int(s5.number_input("Min new labelled rows", 100, 100000, 300,
                                    help="After a drift alert, monitoring continues until this many post-drift labelled rows exist."))
     snooze = int(s6.number_input("Snooze after skipping (batches)", 0, 200, 10))
-    with st.expander("Advanced settings"):
-        a1, a2, a3 = st.columns(3)
-        win = int(a1.number_input("Recent window (rows)", 50, 100000, 500))
-        replay = int(a2.number_input("Continual replay sample (old rows)", 50, 20000, 500))
-        seed = int(a3.number_input("Random seed", 0, 9999, 42))
-        a4, a5 = st.columns(2)
-        if task == "classification":
-            vc = df[target].dropna().astype(str).value_counts()
-            opts = sorted(vc.index)[:50]
-            dflt = vc.index[-1] if len(vc) == 2 else vc.index[0]
-            pos = a5.selectbox("Class of interest (precision / recall / F1)", opts, index=opts.index(dflt) if dflt in opts else 0)
-            sel = a4.selectbox("Strategy selection criterion", CLS_SEL, help="Lower loss wins. Recall criterion uses 1 - recall.")
-        else:
-            pos, sel = None, a4.selectbox("Strategy selection criterion", REG_SEL)
-        src_file = st.file_uploader("Optional source-domain CSV for transfer learning (same feature columns and target)",
-                                    type=["csv"], key="src")
+    # Fixed defaults (no advanced configuration): window 500 rows, replay sample 500 rows, seed 42,
+    # selection criterion = error rate / MAE, class of interest = rarest class (binary) or most common class.
+    win, replay, seed, src_file = 500, 500, 42, None
+    if task == "classification":
+        vc = df[target].dropna().astype(str).value_counts()
+        pos, sel = (vc.index[-1] if len(vc) == 2 else vc.index[0]), CLS_SEL[0]
+    else:
+        pos, sel = None, REG_SEL[0]
 
     if st.button("Start monitoring", type="primary"):
         d = df.copy()
@@ -429,7 +481,7 @@ with st.container(border=True):
                  nb=int(np.ceil((len(y) - n_tr) / B)), z=SENS[sens], delay=delay, min_rows=min_rows, snooze=snooze,
                  win=win, replay=replay, sel=sel, pos=pos, classes=classes, source=source, src_msg=src_msg,
                  version=0, k=0, errs=[], thr=[], ver=[], bad=[], good=0, alert=None, snooze_until=0,
-                 cand=None, events=[], retrains=[], comps=[])
+                 cand=None, events=[], retrains=[], comps=[], psi=[], dflag=False, spec=build_spec(X.iloc[:n_tr], num, cat))
         try:
             S["model"] = Bundle(family, task, num, cat, classes, seed).fit(X.iloc[:n_fit], y[:n_fit])
             S["ref_m"], S["ref_s"] = ref_stats(task, row_err(task, y[n_fit:n_tr], S["model"].predict(X.iloc[n_fit:n_tr])))
@@ -484,79 +536,56 @@ with st.container(border=True):
     al = S["alert"]
     status = ("Finished" if done and not ready(S) else "Decision needed" if ready(S)
               else "Drift suspected, collecting data" if al else "Monitoring")
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Batches received", f"{S['k']} / {S['nb']}")
     m2.metric("Deployed model", f"v{S['version']}")
     m3.metric("Retraining events", len(S["retrains"]))
-    m4.metric("Status", status)
+    m4.metric("Error status", status)
+    pmx, ptop, pall = latest_psi(S)
+    m5.metric("Input drift (PSI)", psi_status(pmx), f"{pmx:.2f} · {ptop}" if ptop else None, delta_color="off",
+              help=f"Population Stability Index of the latest {PSI_WINDOW} batches vs the reference. <{PSI_MOD} stable, "
+                   f"{PSI_MOD}-{PSI_SIG} moderate, ≥{PSI_SIG} significant.")
 
-    # ------------------------------------------------------------------
-# Main graph (safe against mismatched monitoring arrays)
-# ------------------------------------------------------------------
-if S["k"]:
-    fig = go.Figure()
+    if S["k"]:
+        fig, xs, ver = go.Figure(), np.arange(1, S["k"] + 1), np.array(S["ver"])
+        for v in range(S["version"] + 1):
+            idx = np.where(ver == v)[0]
+            fig.add_trace(go.Scatter(x=xs[idx], y=np.array(S["errs"])[idx], mode="lines+markers", name=f"Model v{v}"))
+        fig.add_trace(go.Scatter(x=xs, y=S["thr"], mode="lines", name="Drift threshold", line=dict(dash="dash", color="#d1342f")))
+        for r in S["retrains"]:
+            fig.add_vline(x=r["applied"] + 0.5, line_color="#2e9e5b", annotation_text=f"retrain → v{r['version']}")
+        if al:
+            fig.add_vline(x=al["start"] + 1, line_color="#d1342f", annotation_text="drift starts")
+        fig.update_layout(title=f"Prediction error per incoming batch ({ERR})", xaxis_title="Batch", yaxis_title=ERR,
+                          height=340, margin=dict(t=50, b=30))
+        st.plotly_chart(fig)
+        pm = np.array([max([v for v in d.values() if not np.isnan(v)], default=np.nan) for d in S["psi"]])
+        q1, q2 = st.columns([3, 2])
+        f2 = go.Figure(go.Scatter(x=xs, y=pm, mode="lines+markers", name="Max feature PSI", line=dict(color="#7b61ff")))
+        f2.add_hline(y=PSI_MOD, line_dash="dot", line_color="#e0a100", annotation_text="moderate")
+        f2.add_hline(y=PSI_SIG, line_dash="dash", line_color="#d1342f", annotation_text="significant")
+        for r in S["retrains"]:
+            f2.add_vline(x=r["applied"] + 0.5, line_color="#2e9e5b")
+        f2.update_layout(title="Input (feature) drift: max PSI vs reference", xaxis_title="Batch", yaxis_title="PSI",
+                         height=300, margin=dict(t=50, b=30))
+        q1.plotly_chart(f2)
+        top8 = sorted(pall.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        if top8:
+            f3 = go.Figure(go.Bar(x=[v for _, v in top8], y=[k for k, _ in top8], orientation="h",
+                                  marker_color=["#d1342f" if v >= PSI_SIG else "#e0a100" if v >= PSI_MOD else "#2e9e5b" for _, v in top8],
+                                  text=[f"{v:.2f}" for _, v in top8]))
+            f3.update_layout(title="Most-shifted features (latest window)", yaxis=dict(autorange="reversed"),
+                             xaxis_title="PSI", height=300, margin=dict(t=50, b=30))
+            q2.plotly_chart(f3)
+        data_sig = pmx >= PSI_SIG
+        if data_sig and not al:
+            st.info(f"Inputs have shifted (top: **{ptop}**, PSI {pmx:.2f}) but the model's error has not risen enough to alert yet. "
+                    "Keep monitoring: input drift alone does not prove the model got worse.")
+        elif data_sig and al:
+            st.info("Error rose **and** inputs shifted: consistent with data drift affecting performance (concept drift cannot be ruled out).")
+        elif al and pmx < PSI_MOD:
+            st.info("Error rose **without** notable input drift: more suggestive of concept drift, label problems or an unmeasured factor.")
 
-    # Convert monitoring history into arrays
-    ver_all = np.asarray(S["ver"])
-    errs_all = np.asarray(S["errs"], dtype=float)
-
-    # Ensure every plotted array has the same length
-    n = min(S["k"], len(ver_all), len(errs_all), len(S["thr"]))
-
-    xs = np.arange(1, n + 1)
-    ver = ver_all[:n]
-    errs = errs_all[:n]
-    thresholds = np.asarray(S["thr"], dtype=float)[:n]
-
-    for v in sorted(np.unique(ver)):
-        idx = np.flatnonzero(ver == v)
-
-        # Safe because idx is generated from the aligned version array
-        fig.add_trace(
-            go.Scatter(
-                x=xs[idx],
-                y=errs[idx],
-                mode="lines+markers",
-                name=f"Model v{v}"
-            )
-        )
-
-    fig.add_trace(
-        go.Scatter(
-            x=xs,
-            y=thresholds,
-            mode="lines",
-            name="Drift threshold",
-            line=dict(dash="dash", color="#d1342f")
-        )
-    )
-
-    for r in S["retrains"]:
-        batch_x = r["applied"] + 1
-        if 1 <= batch_x <= n:
-            fig.add_vline(
-                x=batch_x,
-                line_color="#2e9e5b",
-                annotation_text=f"Retrain v{r['version']}"
-            )
-
-    if S["alert"] is not None:
-        drift_x = S["alert"]["start"] + 1
-        if 1 <= drift_x <= n:
-            fig.add_vline(
-                x=drift_x,
-                line_color="#d1342f",
-                annotation_text="Drift starts"
-            )
-
-    fig.update_layout(
-        title="Model drift: error per incoming batch",
-        xaxis_title="Batch",
-        yaxis_title="MAE" if S["task"] == "regression" else "Error rate",
-        height=380
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
     if al and al["status"] == "waiting":
         st.info(f"Drift suspected since batch {al['start'] + 1}, but only {new_rows(S):,} of {S['min_rows']:,} new labelled rows have "
                 "arrived. Monitoring continues; you will be asked once there is enough data, or the alert clears if error returns to normal.")
@@ -582,6 +611,8 @@ if ready(S):
         d2.metric("Historical labelled rows", f"{c['n_old']:,}")
         d3.metric("New labelled rows", f"{c['n_new']:,}")
         d4.metric("Held-out evaluation rows", f"{c['hold']:,}")
+        if not np.isnan(pmx):
+            st.caption(f"Input drift at this point: {psi_status(pmx)} (max PSI {pmx:.2f}, feature '{ptop}').")
         lab = f"{c['crit']} (lower is better)" if c["crit"] in ("Error rate", "MAE", "RMSE") else "1 − recall of class of interest (lower is better)"
         fig = go.Figure(go.Bar(x=t["Selection loss"], y=t["Strategy"], orientation="h", text=t["Selection loss"].round(4),
                                marker_color=["#888" if s == KEEP else "#5b8def" if s in ADV else "#2e9e5b" for s in t["Strategy"]]))
