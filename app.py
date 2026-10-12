@@ -1,22 +1,26 @@
-"""Model Drift Dashboard: fully automatic (Hoeffding Adaptive Tree, `river`).
+"""
+Model Drift Dashboard — Hoeffding Adaptive Tree edition
 
-One deployed model streams through the data. When drift is confirmed the app adapts BY ITSELF:
-    1. A copy of the model keeps learning from the new rows (never touches the live model).
-    2. The copy and the live model are tested on the newest rows kept aside.
-    3. The update is deployed unless it is worse. If it is worse, the live model is kept.
-    4. After deploying, the old model is held in reserve. If the new one does worse than the old one over the next
-       few batches, the app rolls back automatically.
-Drift threshold: ref_error + z * ref_std / sqrt(batch size); two flagged batches in a row raise an alert.
+Install:
+    pip install streamlit river pandas numpy plotly scikit-learn
+Run:
+    streamlit run app.py
+
+Rows are processed in their supplied order unless a time column is selected.
+Updates are manual by default. The candidate is a deep copy of the deployed
+River model and is evaluated on recent held-out labelled rows before deployment.
 """
 import copy
 import io
 import warnings
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.metrics import f1_score, precision_recall_fscore_support
+from sklearn.metrics import f1_score, precision_recall_fscore_support, confusion_matrix
 
 try:
     from river import drift as river_drift
@@ -27,35 +31,37 @@ except ImportError:
 
 warnings.filterwarnings("ignore", category=UserWarning, module="river")
 
-# ------------------------------------------------------------------ constants
 SENS = {"Low (fewer alerts)": 4.0, "Medium": 3.0, "High (more alerts)": 2.0}
-MIN_FIT = 30        # minimum labelled rows to train / test
-WATCH = 3           # batches an updated model is watched before the old one is released
+MIN_FIT = 30
 DELTAS = [1e-3, 1e-5, 1e-7, 1e-9]
 ADWIN_DELTAS = [0.1, 0.01, 0.002, 0.0005]
+INC, KEEP = "Continue Learning (new data only)", "Keep Current Model"
 METRICS = {
     "classification": ["Error rate", "1 - macro F1", "Fault-class miss rate (1 - recall)"],
     "regression": ["MAE", "RMSE"],
 }
-ROW_WISE = {"Error rate", "MAE"}   # metrics with a per-row loss, so a noise test is possible
+ROW_WISE = {"Error rate", "MAE"}
 PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
 
 
-# ------------------------------------------------------------------ model
 def make_tree(task, cat, hp, seed):
-    kw = dict(grace_period=int(hp["grace"]), delta=float(hp["delta"]), tau=float(hp["tau"]),
-              nominal_attributes=list(cat) or None, drift_window_threshold=int(hp["win_thr"]),
-              drift_detector=river_drift.ADWIN(delta=float(hp["adwin"])), seed=int(seed))
+    kw = dict(
+        grace_period=int(hp["grace"]), delta=float(hp["delta"]),
+        tau=float(hp["tau"]), nominal_attributes=list(cat) or None,
+        drift_window_threshold=int(hp["win_thr"]),
+        drift_detector=river_drift.ADWIN(delta=float(hp["adwin"])),
+        seed=int(seed),
+    )
     if task == "regression":
         return river_tree.HoeffdingAdaptiveTreeRegressor(**kw)
     return river_tree.HoeffdingAdaptiveTreeClassifier(**kw)
 
 
 class Bundle:
-    """Hoeffding Adaptive Tree + minimal preprocessing (median imputation; categoricals as nominal)."""
-
+    """Online tree plus numeric median imputation."""
     def __init__(self, task, num, cat, hp, seed):
-        self.task, self.num, self.cat, self.hp, self.seed = task, list(num), list(cat), hp, seed
+        self.task, self.num, self.cat = task, list(num), list(cat)
+        self.hp, self.seed = hp, seed
         self.cols = self.num + self.cat
         self.med, self.major, self.tree = {}, None, None
 
@@ -68,38 +74,43 @@ class Bundle:
 
     def _learn(self, rows, ys):
         reg = self.task == "regression"
-        for x, t in zip(rows, ys):
-            self.tree.learn_one(x, float(t) if reg else str(t))
+        for x, y in zip(rows, ys):
+            self.tree.learn_one(x, float(y) if reg else str(y))
 
     def fit(self, X, y):
         y = np.asarray(y)
         if len(y) != len(X):
-            raise ValueError("features and target have different lengths")
+            raise ValueError("Features and target have different lengths.")
         if len(y) < MIN_FIT:
-            raise ValueError(f"only {len(y)} usable labelled rows (need at least {MIN_FIT})")
+            raise ValueError(f"Need at least {MIN_FIT} labelled rows to fit a tree.")
         if self.task == "regression":
             if not np.all(np.isfinite(y.astype(float))):
-                raise ValueError("target contains non-finite values")
+                raise ValueError("Regression target contains non-finite values.")
         else:
             self.major = str(pd.Series(y).mode().iloc[0])
-        self.med = {c: (float(X[c].median()) if X[c].notna().any() else 0.0) for c in self.num}
+        self.med = {
+            c: (float(X[c].median()) if X[c].notna().any() else 0.0)
+            for c in self.num
+        }
         self.tree = make_tree(self.task, self.cat, self.hp, self.seed)
         self._learn(self._rows(X), y)
         return self
 
     def learn(self, X, y):
         y = np.asarray(y)
-        if len(y) == 0:
-            raise ValueError("no labelled rows to learn from")
+        if not len(y):
+            raise ValueError("No labelled rows to learn from.")
         self._learn(self._rows(X), y)
         return self
 
     def predict(self, X):
-        reg = self.task == "regression"
-        out = []
+        reg, out = self.task == "regression", []
         for x in self._rows(X):
-            p = self.tree.predict_one(x)
-            out.append((0.0 if p is None else float(p)) if reg else (self.major if p is None else str(p)))
+            pred = self.tree.predict_one(x)
+            if reg:
+                out.append(0.0 if pred is None else float(pred))
+            else:
+                out.append(self.major if pred is None else str(pred))
         return np.asarray(out, float) if reg else np.asarray(out).astype(str)
 
 
@@ -109,25 +120,32 @@ def row_err(task, y, p):
     return (np.asarray(y) != np.asarray(p)).astype(float)
 
 
-def ref_stats(task, e):
-    m, s = float(e.mean()), float(e.std())
-    s = max(s, 0.1) if task == "classification" else s
-    return m, max(s, 0.1 * m, 1e-9)
+def ref_stats(task, errors):
+    mean, std = float(np.mean(errors)), float(np.std(errors))
+    if task == "classification":
+        std = max(std, 0.1)
+    return mean, max(std, 0.1 * mean, 1e-9)
 
 
-# ------------------------------------------------------------------ metrics
 def evaluate(task, y, p, pos=None):
     y, p = np.asarray(y), np.asarray(p)
     if task == "regression":
         e = np.abs(y.astype(float) - p.astype(float))
-        return dict(mae=float(e.mean()), rmse=float(np.sqrt((e ** 2).mean())))
+        return {"mae": float(e.mean()), "rmse": float(np.sqrt(np.mean(e ** 2)))}
     labels = np.unique(np.concatenate([y, p]))
-    out = dict(err=float((y != p).mean()),
-               macro_f1=float(f1_score(y, p, labels=labels, average="macro", zero_division=0)),
-               recall=np.nan, n_pos=int((y == pos).sum()) if pos is not None else 0)
-    if pos is not None and pos in labels and out["n_pos"] > 0:
-        _, rc, _, _ = precision_recall_fscore_support(y, p, labels=[pos], average=None, zero_division=0)
-        out["recall"] = float(rc[0])
+    out = {
+        "err": float(np.mean(y != p)),
+        "macro_f1": float(f1_score(y, p, labels=labels, average="macro", zero_division=0)),
+        "precision": np.nan, "recall": np.nan, "f1": np.nan,
+        "n_pos": int(np.sum(y == pos)) if pos is not None else 0,
+    }
+    if pos is not None and pos in labels:
+        pr, rc, f1, _ = precision_recall_fscore_support(
+            y, p, labels=[pos], average=None, zero_division=0
+        )
+        out.update(precision=float(pr[0]), f1=float(f1[0]))
+        if out["n_pos"]:
+            out["recall"] = float(rc[0])
     return out
 
 
@@ -135,381 +153,503 @@ def selection_score(metric, m):
     if metric == "Error rate":
         return m["err"]
     if metric == "1 - macro F1":
-        return 1.0 - m["macro_f1"]
-    if metric.startswith("Fault-class miss rate"):
-        return 1.0 - m["recall"] if np.isfinite(m["recall"]) else np.nan
+        return 1 - m["macro_f1"]
+    if metric.startswith("Fault-class"):
+        return 1 - m["recall"] if np.isfinite(m["recall"]) else np.nan
     return m["mae"] if metric == "MAE" else m["rmse"]
 
 
-# ------------------------------------------------------------------ data prep
 @st.cache_data(show_spinner="Reading CSV...")
-def read(data):
+def read_csv_bytes(data):
     for enc in ("utf-8-sig", "latin-1"):
         try:
-            out = pd.read_csv(io.BytesIO(data), encoding=enc)
-            if out.shape[1] <= 1:
-                out = pd.read_csv(io.BytesIO(data), encoding=enc, sep=None, engine="python")
-            return out
+            frame = pd.read_csv(io.BytesIO(data), encoding=enc)
+            if frame.shape[1] <= 1:
+                frame = pd.read_csv(io.BytesIO(data), encoding=enc, sep=None, engine="python")
+            return frame
         except UnicodeDecodeError:
             continue
-    raise ValueError("Could not read the file as CSV.")
+    raise ValueError("Could not read this file as CSV.")
 
 
 def label_str(s):
     s = pd.Series(s)
     if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
-        v = s.to_numpy(float)
-        if len(v) and np.all(np.isfinite(v)) and np.all(np.mod(v, 1) == 0):
-            return v.astype(np.int64).astype(str)
+        values = s.to_numpy(float)
+        if len(values) and np.all(np.isfinite(values)) and np.all(np.mod(values, 1) == 0):
+            return values.astype(np.int64).astype(str)
     return s.astype(str).to_numpy()
 
 
-def build_frame(df, num, cat):
-    parts = {}
-    for c in num:
-        v = np.array(pd.to_numeric(df[c], errors="coerce"), dtype=float)
-        v[~np.isfinite(v)] = np.nan
-        parts[c] = v
-    for c in cat:
-        parts[c] = np.where(df[c].notna(), df[c].astype(str), "(missing)")
-    return pd.DataFrame(parts, index=df.index)
-
-
 def pick_features(df, exclude):
-    num, cat = [], []
-    for c in df.columns:
-        if c in exclude:
+    numeric, categorical = [], []
+    for col in df.columns:
+        if col in exclude:
             continue
-        s, n = df[c], df[c].notna().sum()
+        s, n = df[col], df[col].notna().sum()
         if n == 0 or s.nunique() <= 1:
             continue
         if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
-            if not (s.nunique() / n > 0.99 and bool(np.all(np.mod(s.dropna(), 1) == 0))):  # skip id-like
-                num.append(c)
+            is_id = s.nunique() / n > 0.99 and bool(np.all(np.mod(s.dropna(), 1) == 0))
+            if not is_id:
+                numeric.append(col)
         elif s.nunique() <= 50:
-            cat.append(c)
-    return num, cat
+            categorical.append(col)
+    return numeric, categorical
 
 
-# ------------------------------------------------------------------ session setup
-def init_session(df, target, tcol, task, cfg):
+def build_frame(df, numeric, categorical):
+    parts = {}
+    for col in numeric:
+        values = np.array(pd.to_numeric(df[col], errors="coerce"), dtype=float)
+        values[~np.isfinite(values)] = np.nan
+        parts[col] = values
+    for col in categorical:
+        parts[col] = np.where(df[col].notna(), df[col].astype(str), "(missing)")
+    return pd.DataFrame(parts, index=df.index)
+
+
+def init_session(df, target, time_col, task, cfg):
     if not RIVER_OK:
-        raise ValueError("The `river` package is not installed (pip install river).")
+        raise ValueError("Install River with: pip install river")
     d = df.copy()
-    if tcol not in (None, "(row order)"):
-        tv = pd.to_numeric(d[tcol], errors="coerce") if pd.api.types.is_numeric_dtype(d[tcol]) \
-            else pd.to_datetime(d[tcol], errors="coerce", utc=True)
-        d = d.loc[tv.notna()].assign(_t=tv[tv.notna()]).sort_values("_t", kind="stable").drop(columns="_t")
+    if time_col not in (None, "(row order)"):
+        if pd.api.types.is_numeric_dtype(d[time_col]):
+            tv = pd.to_numeric(d[time_col], errors="coerce")
+        else:
+            tv = pd.to_datetime(d[time_col], errors="coerce", utc=True)
+        d = d.loc[tv.notna()].assign(_time=tv[tv.notna()])
+        d = d.sort_values("_time", kind="stable").drop(columns="_time")
     d = d[d[target].notna()]
     if task == "regression":
         yv = pd.to_numeric(d[target], errors="coerce")
-        d = d.loc[np.isfinite(yv)]
-        y = yv[np.isfinite(yv)].to_numpy(float)
+        d = d.loc[np.isfinite(yv)].copy()
+        y = pd.to_numeric(d[target]).to_numpy(float)
     d = d.reset_index(drop=True)
     if task == "classification":
         y = label_str(d[target])
     B = int(cfg["B"])
-    n_tr = int(len(d) * cfg["train_pct"] / 100)
-    n_fit = int(n_tr * 0.8)
+    n_train = int(len(d) * cfg["train_pct"] / 100)
+    n_fit = int(n_train * 0.8)
     if len(d) < 400:
-        raise ValueError("Need at least 400 labelled rows.")
-    if n_fit < 50 or len(d) - n_tr < 2 * B:
-        raise ValueError("Initial training part is too small, or the streaming part has fewer than 2 batches. "
-                         "Lower the batch size or adjust the training percentage.")
-    num, cat = pick_features(d.iloc[:n_tr], {target, tcol})
-    if not (num or cat):
+        raise ValueError("Please provide at least 400 labelled rows.")
+    if n_fit < 50 or len(d) - n_train < 2 * B:
+        raise ValueError("Training data is too small or the stream has fewer than two batches. Reduce batch size or adjust the training percentage.")
+    numeric, categorical = pick_features(d.iloc[:n_train], {target, time_col})
+    if not (numeric or categorical):
         raise ValueError("No usable feature columns were found.")
-    X = build_frame(d, num, cat)
+    X = build_frame(d, numeric, categorical)
     pos = cfg.get("pos")
     if task == "classification" and pos is None:
-        vals, cnt = np.unique(y, return_counts=True)
-        pos = str(vals[np.argmin(cnt)])
-    hp = dict(grace=int(cfg["grace"]), delta=float(cfg["delta"]), tau=float(cfg["tau"]),
-              adwin=float(cfg["adwin"]), win_thr=int(cfg["win_thr"]))
-    S = dict(X=X, y=y, task=task, hp=hp, seed=int(cfg["seed"]), n_tr=n_tr, B=B,
-             N=len(y) - n_tr, nb=int(np.ceil((len(y) - n_tr) / B)), z=cfg["z"], delay=int(cfg["delay"]),
-             min_rows=int(cfg["min_rows"]), snooze=int(cfg["snooze"]), hold_frac=float(cfg["hold_frac"]),
-             metric=cfg.get("metric") or METRICS[task][0], pos=pos,
-             version=0, k=0, errs=[], thr=[], ver=[], bad=[], good=0, alert=None, snooze_until=0,
-             watch=None, events=[], updates=[], flash=None)
-    try:
-        S["model"] = Bundle(task, num, cat, hp, S["seed"]).fit(X.iloc[:n_fit], y[:n_fit])
-    except Exception as exc:
-        raise ValueError(f"Could not train the first model: {exc}")
-    e = row_err(task, y[n_fit:n_tr], S["model"].predict(X.iloc[n_fit:n_tr]))
-    S["ref_m"], S["ref_s"] = ref_stats(task, e)
+        values, counts = np.unique(y, return_counts=True)
+        pos = str(values[np.argmin(counts)])
+    hp = {k: cfg[k] for k in ("grace", "delta", "tau", "adwin", "win_thr")}
+    S = {
+        "X": X, "y": y, "task": task, "num": numeric, "cat": categorical,
+        "hp": hp, "seed": int(cfg["seed"]), "n_tr": n_train, "B": B,
+        "N": len(y) - n_train, "nb": int(np.ceil((len(y) - n_train) / B)),
+        "z": cfg["z"], "delay": int(cfg["delay"]), "min_rows": int(cfg["min_rows"]),
+        "snooze": int(cfg["snooze"]), "hold_frac": float(cfg["hold_frac"]),
+        "metric": cfg["metric"], "pos": pos, "version": 0, "k": 0,
+        "errs": [], "thr": [], "ver": [], "bad": [], "good": 0,
+        "alert": None, "snooze_until": 0, "cand": None, "events": [],
+        "retrains": [], "flash": None,
+    }
+    S["model"] = Bundle(task, numeric, categorical, hp, S["seed"]).fit(
+        X.iloc[:n_fit], y[:n_fit]
+    )
+    errors = row_err(task, y[n_fit:n_train], S["model"].predict(X.iloc[n_fit:n_train]))
+    S["ref_m"], S["ref_s"] = ref_stats(task, errors)
     return S
 
 
-# ------------------------------------------------------------------ streaming engine
-def log(S, event, detail):
+def log_event(S, event, detail):
     S["events"].append({"Batch": S["k"], "Event": event, "Detail": detail})
-    S["flash"] = (event, detail)
 
 
 def new_rows(S):
-    al = S["alert"]
-    if al is None:
+    if S["alert"] is None:
         return 0
-    return max(0, min((S["k"] - S["delay"]) * S["B"], S["N"]) - al["start"] * S["B"])
-
-
-def check_rollback(S):
-    """After an update, compare the new model with the old one over a few batches; roll back if it is worse."""
-    w = S["watch"]
-    if not w or S["k"] - w["from_k"] < WATCH:
-        return
-    S["watch"] = None
-    live = float(np.mean(S["errs"][w["from_k"]:S["k"]]))
-    if np.isfinite(w["baseline"]) and live > w["baseline"]:
-        S["model"] = w["prev_model"]
-        S["version"] += 1
-        S["ref_m"], S["ref_s"] = w["prev_ref"]
-        S["snooze_until"] = S["k"] + S["snooze"]
-        S["bad"] = []
-        w["record"]["outcome"] = "Rolled back"
-        log(S, "Rolled back", f"v{w['record']['version']} was worse than the old model "
-                              f"({live:.3f} vs {w['baseline']:.3f}); old model restored as v{S['version']}")
-    else:
-        w["record"]["outcome"] = "Kept"
+    known = S["k"] - S["delay"]
+    return max(0, min(known * S["B"], S["N"]) - S["alert"]["start"] * S["B"])
 
 
 def step(S):
-    """Receive one batch: predict with the deployed model, then judge the batch whose labels just arrived."""
-    k, B, n_tr = S["k"], S["B"], S["n_tr"]
-    a, b = n_tr + k * B, min(n_tr + (k + 1) * B, len(S["y"]))
+    k, B, n_train = S["k"], S["B"], S["n_tr"]
+    a = n_train + k * B
+    b = min(n_train + (k + 1) * B, len(S["y"]))
     if b <= a:
         S["k"] = S["nb"]
         return
-    e = row_err(S["task"], S["y"][a:b], S["model"].predict(S["X"].iloc[a:b]))
-    S["errs"].append(float(e.mean()))
+    errors = row_err(S["task"], S["y"][a:b], S["model"].predict(S["X"].iloc[a:b]))
+    S["errs"].append(float(errors.mean()))
     S["thr"].append(S["ref_m"] + S["z"] * S["ref_s"] / np.sqrt(b - a))
     S["ver"].append(S["version"])
     S["k"] = k + 1
-    check_rollback(S)
     j = k - S["delay"]
     if j >= 0 and S["ver"][j] == S["version"]:
         flagged = S["errs"][j] > S["thr"][j]
         if S["alert"] is None:
-            S["bad"] = (S["bad"] + [j] if flagged else []) if not S["watch"] else []
+            S["bad"] = S["bad"] + [j] if flagged else []
             if len(S["bad"]) >= 2 and S["k"] > S["snooze_until"]:
-                S["alert"], S["good"] = dict(start=S["bad"][0], status="waiting"), 0
-                S["bad"] = []
-                log(S, "Drift detected", f"errors above threshold since batch {S['alert']['start'] + 1}")
+                S["alert"] = {"start": S["bad"][0], "status": "waiting"}
+                S["cand"], S["good"], S["bad"] = None, 0, []
+                log_event(S, "Drift alert", f"Errors above threshold since batch {S['alert']['start'] + 1}")
         elif S["alert"]["status"] == "waiting":
             S["good"] = 0 if flagged else S["good"] + 1
             if S["good"] >= 3:
                 S["alert"] = None
-                log(S, "Alert cleared", "error returned to normal on its own")
-    al = S["alert"]
-    if al and al["status"] == "waiting" and new_rows(S) >= S["min_rows"]:
-        al["status"] = "ready"
+                log_event(S, "Alert cleared", "Error returned to normal before retraining")
+    if S["alert"] and S["alert"]["status"] == "waiting" and new_rows(S) >= S["min_rows"]:
+        S["alert"]["status"] = "ready"
 
 
 def ready(S):
     return S["alert"] is not None and S["alert"]["status"] == "ready"
 
 
-def get_new(S):
-    n_tr, B = S["n_tr"], S["B"]
-    s0 = n_tr + S["alert"]["start"] * B
-    s1 = max(s0, n_tr + min((S["k"] - S["delay"]) * B, S["N"]))
-    return S["X"].iloc[s0:s1], S["y"][s0:s1]
-
-
-def adapt(S):
-    """Automatic response to confirmed drift. Deploys the updated model unless it tests worse."""
-    al, task = S["alert"], S["task"]
-    Xn, yn = get_new(S)
-    n = len(yn)
-
-    def skip(why):
-        S["snooze_until"] = S["k"] + S["snooze"]
-        S["alert"], S["bad"], S["good"] = None, [], 0
-        log(S, "Update skipped", why)
-
-    if n < 2 * MIN_FIT:
-        return skip(f"only {n} new labelled rows, not enough to test an update")
-    hold = int(np.clip(round(n * S["hold_frac"]), MIN_FIT, n - MIN_FIT))
-    Xh, yh, Xt, yt = Xn.iloc[-hold:], yn[-hold:], Xn.iloc[:-hold], yn[:-hold]
-    try:
-        cand = copy.deepcopy(S["model"]).learn(Xt, yt)            # test copy: learns from the older new rows
-        p_old, p_new = S["model"].predict(Xh), cand.predict(Xh)
-        if task == "regression" and not (np.all(np.isfinite(p_old)) and np.all(np.isfinite(p_new))):
-            raise ValueError("non-finite predictions")
-    except Exception as exc:
-        return skip(f"could not test the update ({exc})")
-    metric = S["metric"]
-    m_old, m_new = evaluate(task, yh, p_old, S["pos"]), evaluate(task, yh, p_new, S["pos"])
-    if metric.startswith("Fault-class") and not np.isfinite(m_old["recall"]):
-        metric = "Error rate"
-    k_s, r_s = selection_score(metric, m_old), selection_score(metric, m_new)
-    if not (np.isfinite(k_s) and np.isfinite(r_s)):
-        return skip("test score could not be computed")
-    e_old, e_new = row_err(task, yh, p_old), row_err(task, yh, p_new)
-    if metric in ROW_WISE:                                    # worse only if clearly worse (> 2 std. errors)
-        d = e_old - e_new
-        se = d.std(ddof=1) / np.sqrt(len(d)) if len(d) > 1 else np.inf
-        worse = np.isfinite(se) and se > 0 and d.mean() / se < -2
-    else:
-        worse = r_s > k_s
-    if worse:
-        return skip(f"updated model tested worse ({metric} {r_s:.3f} vs {k_s:.3f}); current model kept")
-    try:
-        final = copy.deepcopy(S["model"]).learn(Xn, yn)       # deployed model learns from ALL new rows
-        final.predict(Xn.iloc[:1])
-    except Exception as exc:
-        return skip(f"update failed ({exc})")
-    ver = np.asarray(S["ver"][al["start"]:S["k"]])
-    old_live = np.asarray(S["errs"][al["start"]:S["k"]])[ver == S["version"]]
-    baseline = float(old_live.mean()) if len(old_live) else np.nan
-    rec = dict(version=S["version"] + 1, applied=S["k"], start=al["start"], metric=metric,
-               test_old=k_s, test_new=r_s, live_before=baseline, outcome="Watching")
-    S["watch"] = dict(prev_model=S["model"], prev_ref=(S["ref_m"], S["ref_s"]), from_k=S["k"],
-                      baseline=baseline, record=rec)
-    S["model"], S["version"] = final, S["version"] + 1
-    S["ref_m"], S["ref_s"] = ref_stats(task, e_new)
-    S["updates"].append(rec)
-    S["alert"], S["bad"], S["good"] = None, [], 0
-    log(S, "Model updated", f"v{S['version']} deployed ({metric} {r_s:.3f} vs {k_s:.3f} on {hold:,} recent rows)")
-
-
-def run(S, n):
+def run_batches(S, count=None):
     i = 0
-    while S["k"] < S["nb"] and (n is None or i < n):
+    while S["k"] < S["nb"] and not ready(S) and (count is None or i < count):
         step(S)
         i += 1
-        if ready(S):
-            adapt(S)
 
 
-# ------------------------------------------------------------------ UI
-_NEW_API = tuple(int(x) for x in st.__version__.split(".")[:2] if x.isdigit()) >= (1, 50)
+def get_data(S):
+    start = S["n_tr"] + S["alert"]["start"] * S["B"]
+    end = max(start, S["n_tr"] + min((S["k"] - S["delay"]) * S["B"], S["N"]))
+    return (
+        S["X"].iloc[:start], S["y"][:start],
+        S["X"].iloc[start:end], S["y"][start:end],
+    )
 
 
-def wide(fn, *a, **kw):
-    kw["width" if _NEW_API else "use_container_width"] = "stretch" if _NEW_API else True
-    return fn(*a, **kw)
+@dataclass
+class Plan:
+    kind: str
+    X: Optional[pd.DataFrame] = None
+    y: Optional[np.ndarray] = None
+    note: str = ""
 
 
-def confirm_box(flag, message, yes_label):
-    if not st.session_state.get(flag):
-        return False
-    st.warning(message)
-    a, b = st.columns(2)
-    if a.button(yes_label, key=flag + "_yes", type="primary"):
-        st.session_state[flag] = False
-        return True
-    if b.button("Cancel", key=flag + "_no"):
-        st.session_state[flag] = False
-        st.rerun()
-    return False
+@dataclass
+class Strategy:
+    name: str
+    plan: Callable
+    blurb: str
 
 
-def drift_chart(S):
-    n = min(S["k"], len(S["ver"]), len(S["errs"]), len(S["thr"]))
-    xs, ver = np.arange(1, n + 1), np.asarray(S["ver"])[:n]
-    errs, thr = np.asarray(S["errs"], float)[:n], np.asarray(S["thr"], float)[:n]
-    fig = go.Figure()
-    for i, v in enumerate(sorted(np.unique(ver))):
-        idx = np.flatnonzero(ver == v)
-        fig.add_trace(go.Scatter(x=xs[idx], y=errs[idx], mode="lines+markers", name=f"Model v{v}",
-                                 line=dict(color=PALETTE[i % len(PALETTE)])))
-    fig.add_trace(go.Scatter(x=xs, y=thr, mode="lines", name="Drift threshold", line=dict(dash="dash", color="#c62828")))
-    for r in S["updates"]:
-        if 1 <= r["applied"] + 1 <= n:
-            fig.add_vline(x=r["applied"] + 1, line_color="#2e7d32", annotation_text=f"Update v{r['version']}",
-                          annotation_position="top left")
-    if S["alert"] is not None and 1 <= S["alert"]["start"] + 1 <= n:
-        fig.add_vline(x=S["alert"]["start"] + 1, line_color="#c62828", annotation_text="Drift starts",
-                      annotation_position="top right")
-    fig.update_layout(title="Prediction error per incoming batch", xaxis_title="Batch",
-                      yaxis_title="MAE (target units)" if S["task"] == "regression" else "Error rate",
-                      height=360, margin=dict(t=50, b=40, l=50, r=20), legend=dict(orientation="h", y=-0.2))
-    wide(st.plotly_chart, fig)
+def plan_inc(S, X_old, y_old, X_new, y_new):
+    return Plan("continue", X_new, y_new, f"Learn from {len(y_new):,} new rows")
 
 
-def updates_table(S):
-    st.subheader("Automatic updates")
-    ver, errs = np.asarray(S["ver"]), np.asarray(S["errs"], float)
-    unit = "MAE" if S["task"] == "regression" else "Error rate"
+def plan_keep(S, X_old, y_old, X_new, y_new):
+    return Plan("keep", note="Leave the deployed model unchanged")
+
+
+STRATEGIES = [
+    Strategy(INC, plan_inc, "Keep existing knowledge and learn from recent labelled rows."),
+    Strategy(KEEP, plan_keep, "Make no changes to the deployed model."),
+]
+REGISTRY = {strategy.name: strategy for strategy in STRATEGIES}
+
+
+def execute(S, plan):
+    if plan.kind == "keep":
+        return S["model"]
+    if plan.kind == "continue":
+        return copy.deepcopy(S["model"]).learn(plan.X, plan.y)
+    raise ValueError(f"Unknown plan kind: {plan.kind}")
+
+
+def build_candidate(S, name, data):
+    plan = REGISTRY[name].plan(S, *data)
+    return execute(S, plan), plan.note
+
+
+def compute_candidates(S):
+    X_old, y_old, X_new, y_new = get_data(S)
+    n = len(y_new)
+    if n < 2 * MIN_FIT:
+        return {"error": f"Only {n} new labelled rows. At least {2 * MIN_FIT} are needed to train and evaluate an update."}
+    hold = int(np.clip(round(n * S["hold_frac"]), MIN_FIT, n - MIN_FIT))
+    X_hold, y_hold = X_new.iloc[-hold:], y_new[-hold:]
+    X_train, y_train = X_new.iloc[:-hold], y_new[:-hold]
+    metrics, errors, predictions, failures = {}, {}, {}, []
+    for strategy in STRATEGIES:
+        try:
+            model, _ = build_candidate(S, strategy.name, (X_old, y_old, X_train, y_train))
+            pred = model.predict(X_hold)
+            metrics[strategy.name] = evaluate(S["task"], y_hold, pred, S["pos"])
+            errors[strategy.name] = row_err(S["task"], y_hold, pred)
+            predictions[strategy.name] = pred
+        except Exception as exc:
+            failures.append(f"{strategy.name}: {type(exc).__name__}: {exc}")
+    if KEEP not in metrics:
+        return {"error": "The current model could not be evaluated on held-out rows."}
+    metric = S["metric"]
+    notes = []
+    if metric.startswith("Fault-class") and not np.isfinite(metrics[KEEP]["recall"]):
+        metric = "Error rate"
+        notes.append("No positive-class examples were present in the holdout; showing error rate instead.")
     rows = []
-    for r in S["updates"]:
-        after = errs[ver == r["version"]]
-        rows.append({"Version": f"v{r['version']}", "At batch": r["applied"] + 1,
-                     f"Test {r['metric']} (old to new)": f"{r['test_old']:.3f} to {r['test_new']:.3f}",
-                     f"Live {unit} before": r["live_before"],
-                     f"Live {unit} after": float(after.mean()) if len(after) else np.nan,
-                     "Result": r["outcome"]})
-    wide(st.dataframe, pd.DataFrame(rows).round(4), hide_index=True)
+    for strategy in STRATEGIES:
+        if strategy.name not in metrics:
+            continue
+        m = metrics[strategy.name]
+        row = {"Strategy": strategy.name, "Selection score": selection_score(metric, m)}
+        if S["task"] == "regression":
+            row.update(MAE=m["mae"], RMSE=m["rmse"])
+        else:
+            row.update({
+                "Error rate": m["err"], "Macro F1": m["macro_f1"],
+                "Fault precision": m["precision"], "Fault recall": m["recall"],
+                "Fault F1": m["f1"],
+            })
+        rows.append(row)
+    table = pd.DataFrame(rows)
+    keep_score = float(table.loc[table["Strategy"] == KEEP, "Selection score"].iloc[0])
+    new_score = (
+        float(table.loc[table["Strategy"] == INC, "Selection score"].iloc[0])
+        if INC in metrics else np.nan
+    )
+    verdict = "Not measurable"
+    clear_win = False
+    if np.isfinite(new_score):
+        if metric in ROW_WISE:
+            difference = errors[KEEP] - errors[INC]
+            se = difference.std(ddof=1) / np.sqrt(len(difference)) if len(difference) > 1 else np.inf
+            z_score = difference.mean() / se if np.isfinite(se) and se > 0 else 0.0
+            verdict = (
+                "Updated model is clearly better" if z_score > 2 else
+                "Updated model is clearly worse" if z_score < -2 else
+                "Difference is within noise"
+            )
+            clear_win = z_score > 2
+        else:
+            verdict = (
+                "Updated model scores better" if new_score < keep_score else
+                "Updated model scores worse" if new_score > keep_score else
+                "No measurable difference"
+            )
+        if hold < 100:
+            notes.append(f"Only {hold} held-out rows; the score difference may be noisy.")
+        if S["task"] == "classification" and metrics[KEEP]["n_pos"] < 10:
+            notes.append("Fewer than 10 fault-class examples: fault-class metrics may be unreliable.")
+    return {
+        "table": table, "errs": errors, "preds": predictions, "yh": y_hold,
+        "hold": hold, "n_old": len(y_old), "n_new": n,
+        "n_train": len(y_train), "metric": metric, "warnings": notes,
+        "failed": failures, "k_s": keep_score, "r_s": new_score,
+        "verdict": verdict, "clear_win": clear_win,
+    }
 
 
-CSS = """<style>
-.block-container{padding-top:1.4rem;padding-bottom:1.5rem}
-[data-testid="stMetric"]{background:rgba(128,128,128,.08);border-radius:8px;padding:.45rem .8rem}
-</style>"""
+def apply_choice(S, name):
+    candidate, alert = S["cand"], S["alert"]
+    if name == KEEP:
+        S["snooze_until"] = S["k"] + S["snooze"]
+        log_event(S, "Kept current model", f"No alerts for {S['snooze']} batches")
+        message = f"Kept current model v{S['version']}."
+    else:
+        try:
+            if not candidate or name not in candidate["errs"]:
+                raise ValueError("This strategy has no valid evaluation.")
+            data = get_data(S)
+            model, _ = build_candidate(S, name, data)
+            # Smoke test before swapping the deployed model.
+            model.predict(data[2].iloc[:1])
+            score_table = candidate["table"].set_index("Strategy")["Selection score"]
+            old_version = S["version"]
+            S["model"] = model
+            S["version"] += 1
+            # This is a provisional baseline based on held-out candidate errors.
+            S["ref_m"], S["ref_s"] = ref_stats(S["task"], candidate["errs"][name])
+            S["retrains"].append({
+                "version": S["version"], "strategy": name, "applied": S["k"],
+                "start": alert["start"], "score_new": float(score_table[name]),
+                "score_keep": float(score_table[KEEP]), "metric": candidate["metric"],
+            })
+            log_event(S, "Retrained", f"v{S['version']} deployed; previous version v{old_version}")
+            message = f"Deployed model v{S['version']}."
+        except Exception as exc:
+            log_event(S, "Retraining failed", f"{name}: {exc}. Deployed model unchanged.")
+            return False, f"Update failed: {exc}. The deployed model was not changed."
+    S["alert"], S["cand"], S["bad"], S["good"] = None, None, [], 0
+    return True, message
+
+
+def show_drift_chart(S):
+    n = min(S["k"], len(S["ver"]), len(S["errs"]), len(S["thr"]))
+    if not n:
+        return
+    x = np.arange(1, n + 1)
+    versions = np.asarray(S["ver"])[:n]
+    errors, thresholds = np.asarray(S["errs"])[:n], np.asarray(S["thr"])[:n]
+    fig = go.Figure()
+    for i, version in enumerate(sorted(np.unique(versions))):
+        idx = np.flatnonzero(versions == version)
+        fig.add_trace(go.Scatter(
+            x=x[idx], y=errors[idx], mode="lines+markers",
+            name=f"Model v{version}", line=dict(color=PALETTE[i % len(PALETTE)])
+        ))
+    fig.add_trace(go.Scatter(
+        x=x, y=thresholds, mode="lines", name="Drift threshold",
+        line=dict(dash="dash", color="#c62828")
+    ))
+    if S["alert"]:
+        fig.add_vline(x=S["alert"]["start"] + 1, line_dash="dot", line_color="#c62828")
+    fig.update_layout(
+        title="Prediction error by incoming batch",
+        xaxis_title="Batch",
+        yaxis_title="MAE (target units)" if S["task"] == "regression" else "Error rate",
+        height=350, margin=dict(t=50, b=35, l=45, r=15),
+        legend=dict(orientation="h", y=-0.22),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def decision_panel(S):
+    c, alert = S["cand"], S["alert"]
+    st.subheader("Drift detected — choose a strategy")
+    if c.get("error"):
+        st.warning(c["error"])
+        if st.button("Keep current model", key="keep_unavailable"):
+            S["snooze_until"] = S["k"] + S["snooze"]
+            log_event(S, "Kept current model", "Insufficient data to evaluate update")
+            S["alert"], S["cand"], S["bad"], S["good"] = None, None, [], 0
+            S["flash"] = ("info", "Kept the current model.")
+            st.rerun()
+        return
+
+    st.caption(
+        f"Drift started at batch {alert['start'] + 1} · "
+        f"{c['hold']:,} held-out rows · {c['n_new']:,} new labelled rows"
+    )
+    st.info(c["verdict"])
+    left, right = st.columns(2)
+    can_update = INC in c["errs"]
+
+    with left:
+        with st.container(border=True):
+            st.markdown("### Keep current model")
+            st.metric(c["metric"], f"{c['k_s']:.4f}")
+            st.caption(f"Deployed version v{S['version']}")
+            st.write("No changes.")
+            if st.button("Keep model", key=f"keep_{S['k']}", use_container_width=True):
+                _, msg = apply_choice(S, KEEP)
+                S["flash"] = ("info", msg)
+                st.rerun()
+
+    with right:
+        with st.container(border=True):
+            st.markdown("### Update model")
+            if can_update:
+                st.metric(
+                    c["metric"], f"{c['r_s']:.4f}",
+                    delta=f"{c['r_s'] - c['k_s']:+.4f}",
+                    delta_color="inverse",
+                )
+            else:
+                st.metric(c["metric"], "Unavailable")
+            st.write("Learn from new labelled rows only.")
+            if st.button(
+                "Update model", type="primary", disabled=not can_update,
+                key=f"update_{S['k']}", use_container_width=True,
+            ):
+                ok, msg = apply_choice(S, INC)
+                S["flash"] = ("success" if ok else "error", msg)
+                st.rerun()
+
+    st.caption("Both scores use the same held-out rows. Lower is better; future performance may differ.")
+    if c.get("warnings") or c.get("failed"):
+        with st.expander("Evaluation notes"):
+            for note in c.get("warnings", []):
+                st.write(f"• {note}")
+            for failure in c.get("failed", []):
+                st.write(f"• {failure}")
+
+
+def show_history(S):
+    st.subheader("Model history")
+    rows = []
+    for r in S["retrains"]:
+        rows.append({
+            "Version": f"v{r['version']}",
+            "Strategy": r["strategy"],
+            "Applied at batch": r["applied"] + 1,
+            "Metric": r["metric"],
+            "Updated score": r["score_new"],
+            "Previous score": r["score_keep"],
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows).round(4), hide_index=True, use_container_width=True)
 
 
 def sidebar_config(S):
     with st.sidebar:
         st.header("Configuration")
-        up = st.file_uploader("Upload a CSV (rows in time order, or pick a time column)", type=["csv"])
-        if up is None:
+        upload = st.file_uploader("Upload labelled CSV", type=["csv"])
+        if upload is None:
             return
         try:
-            df = read(up.getvalue())
+            df = read_csv_bytes(upload.getvalue())
         except Exception as exc:
             st.error(str(exc))
             return
+        if len(df.columns) < 2:
+            st.error("CSV must contain a target and at least one feature column.")
+            return
+
         target = st.selectbox("Target column", df.columns, index=len(df.columns) - 1)
-        tcol = st.selectbox("Time column (optional)", ["(row order)"] + [c for c in df.columns if c != target])
-        st.caption("Model: Hoeffding Adaptive Tree. Drift is handled automatically.")
-        guess = "regression" if (pd.api.types.is_numeric_dtype(df[target]) and df[target].nunique() > 10) else "classification"
-        task = st.radio("Task", ["classification", "regression"], index=["classification", "regression"].index(guess),
-                        horizontal=True)
-        train_pct = st.slider("Initial training %", 20, 70, 40, 5)
-        B = int(st.number_input("Batch size (rows)", 20, 5000, 100))
-        sens = st.selectbox("Drift sensitivity", list(SENS), index=1,
-                            help="Threshold = reference error + z * reference std / sqrt(batch size). "
-                                 "z is 4 (Low), 3 (Medium) or 2 (High). Two batches in a row above it count as drift.")
+        time_col = st.selectbox(
+            "Time column (optional)", ["(row order)"] + [col for col in df.columns if col != target]
+        )
+        guess = "regression" if (
+            pd.api.types.is_numeric_dtype(df[target]) and df[target].nunique() > 10
+        ) else "classification"
+        task = st.radio(
+            "Task", ["classification", "regression"],
+            index=["classification", "regression"].index(guess), horizontal=True,
+        )
+        train_pct = st.slider("Initial training (%)", 20, 70, 40, 5)
+        batch_size = int(st.number_input("Batch size", 20, 5000, 100, step=10))
+        sensitivity = st.selectbox("Drift sensitivity", list(SENS), index=1)
         delay = int(st.number_input("Label delay (batches)", 0, 20, 0))
-        min_rows = int(st.number_input("New labelled rows needed before updating", 100, 100000, 300))
-        snooze = int(st.number_input("Pause after a skipped or rolled-back update (batches)", 0, 200, 10))
-        with st.expander("Advanced settings"):
-            hold_frac = st.slider("Share of new rows kept aside for testing", 0.10, 0.40, 0.25, 0.05)
-            metric = st.selectbox("Test metric (lower is better)", METRICS[task])
-            pos = None
-            if task == "classification":
-                tgt = df[target].dropna()
-                labs = sorted(set(label_str(tgt)))[:50]
-                vc = pd.Series(label_str(tgt)).value_counts()
-                dflt = "1" if "1" in labs else (str(vc.index[-1]) if str(vc.index[-1]) in labs else labs[0])
-                pos = st.selectbox("Fault (positive) class", labs, index=labs.index(dflt))
-            st.markdown("**Tree settings**")
-            grace = int(st.number_input("Grace period (rows between split attempts)", 10, 5000, 200, step=10))
-            delta = st.select_slider("Split confidence (smaller = more cautious)", DELTAS, value=1e-7,
+        min_rows = int(st.number_input("New labelled rows before decision", 100, 100000, 300, step=50))
+        snooze = int(st.number_input("Snooze after keeping (batches)", 0, 200, 10))
+        hold_frac = st.slider("Holdout share", 0.10, 0.40, 0.25, 0.05)
+        metric = st.selectbox("Evaluation metric (lower is better)", METRICS[task])
+        pos = None
+        if task == "classification":
+            labels = sorted(set(label_str(df[target].dropna())))
+            if labels:
+                default = labels.index("1") if "1" in labels else 0
+                pos = st.selectbox("Fault class", labels, index=default)
+
+        with st.expander("Tree settings"):
+            grace = int(st.number_input("Grace period", 10, 5000, 200, step=10))
+            delta = st.select_slider("Split confidence (delta)", DELTAS, value=1e-7,
                                      format_func=lambda v: f"{v:.0e}")
-            tau = st.number_input("Tie threshold (tau)", 0.001, 0.5, 0.05, step=0.01, format="%.3f")
-            adwin = st.select_slider("ADWIN sensitivity (larger = reacts sooner)", ADWIN_DELTAS, value=0.002)
-            win_thr = int(st.number_input("Alternate-tree window (rows)", 50, 5000, 300, step=50))
-            seed = int(st.number_input("Random seed", 0, 10_000, 42))
-        running = S is not None and S["k"] > 0
-        go_ = False
-        if st.button("Restart with these settings" if S is not None else "Start monitoring", type="primary"):
-            if running:
-                st.session_state["confirm_restart"] = True
-            else:
-                go_ = True
-        if confirm_box("confirm_restart", "This discards the current session.", "Yes, restart"):
-            go_ = True
-        if go_:
-            cfg = dict(train_pct=train_pct, B=B, z=SENS[sens], delay=delay, min_rows=min_rows, snooze=snooze,
-                       hold_frac=hold_frac, metric=metric, pos=pos, seed=seed,
-                       grace=grace, delta=delta, tau=float(tau), adwin=adwin, win_thr=win_thr)
+            tau = st.number_input("Tie threshold", 0.001, 0.5, 0.05, step=0.01)
+            adwin = st.select_slider("ADWIN sensitivity", ADWIN_DELTAS, value=0.002)
+            win_thr = int(st.number_input("Alternate-tree window", 50, 5000, 300, step=50))
+            seed = int(st.number_input("Random seed", 0, 10000, 42))
+
+        if S is not None and S["k"] > 0:
+            st.caption("Changing settings requires restarting the session.")
+        if st.button("Restart with settings" if S else "Start monitoring", type="primary"):
+            cfg = {
+                "train_pct": train_pct, "B": batch_size, "z": SENS[sensitivity],
+                "delay": delay, "min_rows": min_rows, "snooze": snooze,
+                "hold_frac": hold_frac, "metric": metric, "pos": pos, "seed": seed,
+                "grace": grace, "delta": delta, "tau": float(tau),
+                "adwin": adwin, "win_thr": win_thr,
+            }
             try:
-                with st.spinner("Training the first model..."):
-                    st.session_state["S"] = init_session(df, target, tcol, task, cfg)
-            except ValueError as exc:
+                with st.spinner("Training initial Hoeffding Adaptive Tree..."):
+                    st.session_state["S"] = init_session(df, target, time_col, task, cfg)
+            except Exception as exc:
                 st.error(str(exc))
                 return
             st.rerun()
@@ -517,61 +657,85 @@ def sidebar_config(S):
 
 def main():
     st.set_page_config(page_title="Model Drift Dashboard", page_icon="📈", layout="wide")
-    st.markdown(CSS, unsafe_allow_html=True)
+    st.markdown("""
+    <style>
+      .block-container {padding-top: 1.3rem; padding-bottom: 1.5rem;}
+      [data-testid="stMetric"] {
+        background: rgba(128,128,128,.08); border-radius: 10px;
+        padding: .6rem .8rem;
+      }
+    </style>
+    """, unsafe_allow_html=True)
     st.title("📈 Model Drift Dashboard")
+    st.caption("Monitor one deployed online model and review measured evidence before updating.")
     if not RIVER_OK:
-        st.error("This app needs the `river` package. Install it with `pip install river` and restart.")
+        st.error("River is required. Install it with `pip install river` and restart the app.")
         st.stop()
+
     S = st.session_state.get("S")
     sidebar_config(S)
     S = st.session_state.get("S")
     if S is None:
-        st.info("Upload a CSV in the sidebar and click **Start monitoring**.")
+        st.info("Upload a CSV in the sidebar, select the target and click Start monitoring.")
         st.stop()
 
-    done = S["k"] >= S["nb"]
+    finished = S["k"] >= S["nb"]
+    blocked = ready(S) or finished
     with st.container(border=True):
-        b0, b1, b2, b3 = st.columns([2.4, 1, 1, 1])
-        if b0.button("▶ Run all", type="primary", disabled=done, key="run_all"):
-            run(S, None)
-        if b1.button("Next batch", disabled=done, key="run_1"):
-            run(S, 1)
-        if b2.button("Next 10 batches", disabled=done, key="run_10"):
-            run(S, 10)
-        if b3.button("Reset", key="reset"):
-            if S["k"] > 0:
-                st.session_state["confirm_reset"] = True
-            else:
-                st.session_state.pop("S")
-                st.rerun()
-    if confirm_box("confirm_reset", "Reset the session? History will be discarded.", "Yes, reset"):
-        st.session_state.pop("S")
-        st.rerun()
+        controls = st.columns([2.2, 1, 1, 1])
+        if controls[0].button("▶ Run until decision", type="primary", disabled=blocked, use_container_width=True):
+            run_batches(S)
+            st.rerun()
+        if controls[1].button("Next batch", disabled=blocked, use_container_width=True):
+            run_batches(S, 1)
+            st.rerun()
+        if controls[2].button("Next 10", disabled=blocked, use_container_width=True):
+            run_batches(S, 10)
+            st.rerun()
+        if controls[3].button("Reset session", use_container_width=True):
+            st.session_state.pop("S", None)
+            st.rerun()
 
-    al = S["alert"]
-    status = ("Finished" if done else "Collecting data after drift" if al
-              else "Checking updated model" if S["watch"] else "Monitoring")
-    m = st.columns(4)
-    m[0].metric("Batches received", f"{S['k']} / {S['nb']}")
-    m[1].metric("Deployed model", f"Adaptive tree v{S['version']}")
-    m[2].metric("Automatic updates", len(S["updates"]))
-    m[3].metric("Status", status)
+    alert = S["alert"]
+    status = (
+        "Finished" if finished and not ready(S) else
+        "Decision needed" if ready(S) else
+        "Collecting labels" if alert else "Monitoring"
+    )
+    cols = st.columns(4)
+    cols[0].metric("Batches processed", f"{S['k']} / {S['nb']}")
+    cols[1].metric("Deployed model", f"v{S['version']}")
+    cols[2].metric("Updates", len(S["retrains"]))
+    cols[3].metric("Status", status)
 
     if S.get("flash"):
-        title, detail = S["flash"]
+        level, message = S["flash"]
         S["flash"] = None
-        (st.success if title == "Model updated" else st.warning if title in ("Rolled back", "Update skipped")
-         else st.info)(f"**{title}:** {detail}")
+        getattr(st, level)(message)
 
-    if S["k"]:
-        drift_chart(S)
-    if S["updates"]:
-        updates_table(S)
+    show_drift_chart(S)
+    if alert and alert["status"] == "waiting":
+        st.info(
+            f"Drift suspected from batch {alert['start'] + 1}. "
+            f"{new_rows(S):,} of {S['min_rows']:,} new labelled rows are available. "
+            "Monitoring continues until enough labels arrive or the alert clears."
+        )
+
+    if ready(S):
+        if S["cand"] is None:
+            with st.spinner("Evaluating the candidate on held-out recent rows..."):
+                try:
+                    S["cand"] = compute_candidates(S)
+                except Exception as exc:
+                    S["cand"] = {"error": f"Could not evaluate candidate: {exc}"}
+        decision_panel(S)
+
+    if S["retrains"]:
+        show_history(S)
     if S["events"]:
-        with st.expander("Activity log", expanded=False):
-            wide(st.dataframe, pd.DataFrame(S["events"]), hide_index=True)
+        with st.expander("Event log"):
+            st.dataframe(pd.DataFrame(S["events"]), hide_index=True, use_container_width=True)
 
 
 if __name__ == "__main__":
     main()
-    
