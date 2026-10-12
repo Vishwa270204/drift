@@ -563,34 +563,35 @@ def decision_panel(S):
                     f"candidate, {c['hold']:,} held out")
         m[3].metric("Held-out evaluation rows", f"{c['hold']:,}")
 
-        st.markdown(c["why"])
-        for w in c["warnings"]:
-            st.warning(w)
         can_update = INC in c["errs"]
-        if not can_update:
-            st.error("Continue learning could not be evaluated, so updating is disabled.")
-
-        v1, v2 = st.columns(2)
-        v1.metric(f"Current model (v{S['version']})", f"{c['k_s']:.4f}", help=f"Held-out {c['metric']}, lower is better")
-        if can_update:
-            v2.metric("After continue learning", f"{c['r_s']:.4f}", delta=f"{c['r_s'] - c['k_s']:+.4f}",
-                      delta_color="inverse", help=f"Held-out {c['metric']}, lower is better")
-        else:
-            v2.metric("After continue learning", "n/a")
-        st.markdown(f"**What \"continue learning\" does:** {REG[INC].blurb}")
-        st.caption(f"The scores above come from a test on {c['hold']:,} recent rows kept aside. "
-                   "The final model learns from all new rows, so results may differ slightly.")
-
+        st.markdown(f"**Test result:** {c['verdict']}")
         k = S["k"]
-        a1, a2, _ = st.columns([1.6, 1.6, 3])
-        if a1.button("Update model (continue learning)", type="primary", disabled=not can_update, key=f"apply_{k}"):
-            ok, msg = apply_choice(S, INC)
-            S["flash"] = ("success" if ok else "error", msg)
-            st.rerun()
-        if a2.button("Keep current model", key=f"skip_{k}"):
-            ok, msg = apply_choice(S, KEEP)
-            S["flash"] = ("info", msg)
-            st.rerun()
+        o1, o2 = st.columns(2)
+        with o1.container(border=True):
+            st.markdown("#### Keep current model")
+            st.metric(f"{c['metric']} (v{S['version']})", f"{c['k_s']:.4f}")
+            st.caption(REG[KEEP].blurb)
+            if st.button("Keep current model", key=f"skip_{k}"):
+                ok, msg = apply_choice(S, KEEP)
+                S["flash"] = ("info", msg)
+                st.rerun()
+        with o2.container(border=True):
+            st.markdown("#### Update model")
+            if can_update:
+                st.metric(f"{c['metric']} after update", f"{c['r_s']:.4f}", delta=f"{c['r_s'] - c['k_s']:+.4f}",
+                          delta_color="inverse")
+            else:
+                st.metric(f"{c['metric']} after update", "n/a")
+            st.caption(REG[INC].blurb)
+            if st.button("Update model", type="primary", disabled=not can_update, key=f"apply_{k}"):
+                ok, msg = apply_choice(S, INC)
+                S["flash"] = ("success" if ok else "error", msg)
+                st.rerun()
+        st.caption(f"Lower is better. Tested on {c['hold']:,} recent rows kept aside.")
+        if c["warnings"]:
+            with st.expander(f"Notes ({len(c['warnings'])})"):
+                for w in c["warnings"]:
+                    st.write("• " + w)
         if c["failed"]:
             st.caption("Failed to build: " + "; ".join(f"{n} ({why})" for n, why in c["failed"]))
         with st.expander("Detailed held-out metrics and confusion matrix"):
