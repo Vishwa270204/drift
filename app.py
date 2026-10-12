@@ -3,7 +3,6 @@ import copy
 import hashlib
 import io
 import warnings
-from contextlib import nullcontext
 
 import numpy as np
 import pandas as pd
@@ -27,7 +26,7 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 warnings.filterwarnings("ignore", message="Got `batch_size`")
 
-st.set_page_config(page_title="Model Drift Monitor", page_icon="📈", layout="wide")
+st.set_page_config(page_title="CSV Drift & Learning Strategy Lab", page_icon="📈", layout="wide")
 
 # --------------------------------------------------------------------------------------
 # Constants
@@ -801,7 +800,7 @@ def run_simulation(stream, spec, lo, hi, B, model, policy, delay, adwin_delta, c
 # ======================================================================================
 # APP
 # ======================================================================================
-st.title("📈 Model Drift Monitoring")
+st.title("📈 Model Drift & Learning Strategy Lab")
 st.caption("Upload any tabular CSV. Analyses adapt to your columns, and anything that needs labels, "
            "a compatible model, or a source model is marked unavailable instead of being faked.")
 st.info("Drift in the *inputs* is evidence that data changed; it does not by itself prove a model got worse. "
@@ -964,8 +963,8 @@ exports = {}
 drift_summary = None
 
 # ---------------------------------------------------------------- tabs
-# Single-page layout: keep section blocks in flow without rendering navigation tabs.
-tabs = [nullcontext() for _ in range(7)]
+tabs = st.tabs(["Overview", "Data Quality", "Drift Detection", "Model Performance",
+                "Learning Strategy Comparison", "Live Stream Simulation", "Results and Downloads"])
 
 # ======================================================= Overview
 with tabs[0]:
@@ -1057,18 +1056,18 @@ with tabs[1]:
             fig = px.bar(miss_df, x="Missing (%)", y="Column", orientation="h", title="Missing values by column",
                          hover_data=["Missing"])
             fig.update_layout(yaxis=dict(autorange="reversed"), height=max(300, 28 * len(miss_df) + 100))
-            # Graph omitted to keep the dashboard focused.
+            st.plotly_chart(fig)
         else:
             st.success("No missing values.")
     with right:
         if cat_list:
             fig = px.bar(info[info["Column"].isin(cat_list)], x="Column", y="Unique", title="Unique values per categorical column")
-            # Graph omitted to keep the dashboard focused.
+            st.plotly_chart(fig)
     if cat_list:
         pick = st.selectbox("Inspect value counts for", cat_list, key=f"vc_{fid}")
         vc = df_all[pick].astype(str).where(df_all[pick].notna()).value_counts().head(25).reset_index()
         vc.columns = [pick, "Count"]
-        # Graph omitted to keep the dashboard focused.
+        st.plotly_chart(px.bar(vc, x=pick, y="Count", title=f"Top values of '{pick}'"))
 
 # ======================================================= Drift Detection
 with tabs[2]:
@@ -1154,7 +1153,7 @@ with tabs[2]:
                     det = drift_det[feat].melt(id_vars=["Bin", "PSI contribution"], value_vars=["Reference (%)", "Comparison (%)"],
                                                var_name="Window", value_name="Share (%)")
                     fig = px.bar(det, x="Bin", y="Share (%)", color="Window", barmode="group", title=f"Category shares for '{feat}'")
-                # Graph omitted to keep the dashboard focused.
+                st.plotly_chart(fig)
                 with st.expander("Per-bin PSI contributions"):
                     st.dataframe(drift_det[feat].round(4), hide_index=True)
 
@@ -1196,7 +1195,7 @@ with tabs[3]:
                              opacity=0.6)
             lim = [float(min(yte.min(), perf["pred_test"].min())), float(max(yte.max(), perf["pred_test"].max()))]
             fig.add_trace(go.Scatter(x=lim, y=lim, mode="lines", name="Perfect prediction", line=dict(dash="dash", color="gray")))
-            # Graph omitted to keep the dashboard focused.
+            l.plotly_chart(fig)
             if chrono:
                 fig = go.Figure()
                 xt = x_lab.iloc[te]
@@ -1205,7 +1204,7 @@ with tabs[3]:
                 fig.update_layout(title="Actual and predicted over the test period", xaxis_title="Time / row", yaxis_title=target)
             else:
                 fig = px.histogram(x=yte - perf["pred_test"], nbins=40, labels={"x": "Residual (actual - predicted)"}, title="Residual distribution (test)")
-            # Graph omitted to keep the dashboard focused.
+            r.plotly_chart(fig)
         else:
             maj = nv["Accuracy"]
             st.markdown(f"**Summary:** on {len(te):,} unseen test rows accuracy is {mt['Accuracy']:.3f} and weighted F1 {mt['F1 (weighted)']:.3f}. "
@@ -1217,14 +1216,14 @@ with tabs[3]:
                 cm = confusion_matrix(yte, perf["pred_test"], labels=labs)
                 fig = px.imshow(cm, x=labs, y=labs, text_auto=True, color_continuous_scale="Blues",
                                 labels=dict(x="Predicted", y="Actual", color="Count"), title="Confusion matrix (test)")
-                # Graph omitted to keep the dashboard focused.
+                l.plotly_chart(fig)
             p, rc, f1, sup = precision_recall_fscore_support(yte, perf["pred_test"], labels=labs, zero_division=0)
             rep = pd.DataFrame({"Class": labs, "Precision": p, "Recall": rc, "F1": f1, "Support": sup})
             r.dataframe(rep.round(3), hide_index=True)
             dist = pd.concat([pd.DataFrame({"Class": y_arr[tr]}).assign(Partition="Training"),
                               pd.DataFrame({"Class": yte}).assign(Partition="Test")])
             dist = dist.groupby(["Partition", "Class"]).size().reset_index(name="Count")
-            # Graph omitted to keep the dashboard focused.
+            r.plotly_chart(px.bar(dist, x="Class", y="Count", color="Partition", barmode="group", title="Class balance"))
         st.caption("With small test sets these metrics have real sampling uncertainty; compare with the naive reference rather than trusting a single number.")
 
         # ---------------- concept drift
@@ -1267,7 +1266,7 @@ causes. Detection requires **real labels**, **chronological order**, and enough 
                                                     arrayminus=wdf[ycol] - wdf["CI low"])))
             fig.update_layout(title=f"{ycol} per evaluation window (95% bootstrap CI)", xaxis_title="Window (chronological)",
                               yaxis_title="MAE" if task == "regression" else "Error rate")
-            # Graph omitted to keep the dashboard focused.
+            st.plotly_chart(fig)
             e1, e2 = avail["error"].to_numpy()[edges[0]:edges[1]], avail["error"].to_numpy()[edges[-2]:edges[-1]]
             rng = np.random.default_rng(seed)
             diff = (e2[rng.integers(0, len(e2), (500, len(e2)))].mean(axis=1) - e1[rng.integers(0, len(e1), (500, len(e1)))].mean(axis=1))
@@ -1300,7 +1299,7 @@ causes. Detection requires **real labels**, **chronological order**, and enough 
                 vline(fig, avail["x"].iloc[h], "change")
             fig.update_layout(title="Frozen-baseline error over time with detected changes", xaxis_title="Time / row",
                               yaxis_title="Rolling mean absolute error" if task == "regression" else "Rolling error rate")
-            # Graph omitted to keep the dashboard focused.
+            st.plotly_chart(fig)
             if hits:
                 hdf = pd.DataFrame({"Detection #": range(1, len(hits) + 1), "Stream row": hits, "Time / row": [avail["x"].iloc[h] for h in hits],
                                     "Partition": [avail["Partition"].iloc[h] for h in hits],
@@ -1401,7 +1400,7 @@ and are scored on the **same held-out test rows**, which no strategy sees.
                                         index=[c for c in mdf.columns if c in HIGHER_BETTER].index(mname), key=f"chm_{fid}")
                 fig = px.bar(mdf, x="Strategy", y=chart_metric, color="Strategy", text_auto=".4g", title=f"{chart_metric} by strategy (held-out test)")
                 fig.update_layout(showlegend=False, xaxis_title="")
-                # Graph omitted to keep the dashboard focused.
+                st.plotly_chart(fig)
                 if chrono:
                     fig = go.Figure()
                     w = max(10, len(res["y_test"]) // 25)
@@ -1410,7 +1409,7 @@ and are scored on the **same held-out test rows**, which no strategy sees.
                         fig.add_trace(go.Scatter(x=res["x_test"], y=e, mode="lines", name=nm))
                     fig.update_layout(title="Rolling error over the test period by strategy", xaxis_title="Time / row",
                                       yaxis_title="Rolling MAE" if task == "regression" else "Rolling error rate")
-                    # Graph omitted to keep the dashboard focused.
+                    st.plotly_chart(fig)
                 pick = st.selectbox("Inspect predictions of", list(res["preds"]), key=f"inspect_{fid}")
                 pp = res["preds"][pick]
                 if task == "regression":
@@ -1421,7 +1420,7 @@ and are scored on the **same held-out test rows**, which no strategy sees.
                     labs = sorted(set(res["y_test"]) | set(pp))
                     fig = px.imshow(confusion_matrix(res["y_test"], pp, labels=labs), x=labs, y=labs, text_auto=True, color_continuous_scale="Blues",
                                     labels=dict(x="Predicted", y="Actual", color="Count"), title=f"Confusion matrix: {pick}")
-                # Graph omitted to keep the dashboard focused.
+                st.plotly_chart(fig)
 
 # ======================================================= Live Stream Simulation
 with tabs[5]:
@@ -1506,7 +1505,7 @@ with tabs[5]:
                 fig.add_trace(go.Scatter(x=seen["Batch"], y=seen["Mean PSI"], mode="lines", name="Mean PSI", line=dict(dash="dot")))
                 fig.add_hline(y=sim["thr"][1], line_dash="dash", line_color=STATUS_COLORS["Significant"], annotation_text="alert threshold")
                 fig.update_layout(title="Input drift per batch (PSI vs reference)", xaxis_title="Batch", yaxis_title="PSI")
-                # Graph omitted to keep the dashboard focused.
+                st.plotly_chart(fig)
                 if stask:
                     pm = "MAE" if stask == "regression" else "Accuracy"
                     measured = bdf[bdf["Labels available at batch"] <= cur]
@@ -1521,7 +1520,7 @@ with tabs[5]:
                             vline(fig, ar["Batch"], "perf alert")
                         fig.update_layout(title=f"{pm} per batch (shown once labels have arrived; gray lines = candidate updates)",
                                           xaxis_title="Batch (when predicted)", yaxis_title=pm)
-                        # Graph omitted to keep the dashboard focused.
+                        st.plotly_chart(fig)
                         st.dataframe(measured.iloc[[-1]][["Batch"] + [c for c in measured.columns if c.startswith(("Production", "Candidate"))]].round(4), hide_index=True)
                     pending = bdf[(bdf["Labels available at batch"] > cur)].shape[0]
                     if pending:
