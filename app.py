@@ -1,18 +1,18 @@
 """Model Drift Dashboard (Hoeffding Adaptive Tree edition).
 
 Streams a labelled CSV through ONE deployed model, a Hoeffding Adaptive Tree from `river` (pip install river),
-detects drift from per-batch error, and when drift is confirmed lets the user apply ONE adaptation technique:
-online incremental learning.
+detects drift from per-batch error, and when drift is confirmed shows the user measured evidence comparing the
+current model with a copy that keeps learning on the new rows. The user then decides: update or keep.
 
     Strategy (registry)  ->  plan function (data selection)  ->  execute() (training procedure)
 
-A Hoeffding Adaptive Tree keeps learning one row at a time and has ADWIN detectors inside its nodes that grow
-alternate subtrees and swap them in when the old branch degrades. The only adaptation offered is:
-    * Continue Learning : copy of the deployed tree learns the new rows incrementally
-    * Keep Current Model: baseline / skip option
+Drift threshold (one-sided z-test on the batch mean error):
+    reference mean/std of per-row error come from the last 20% of the initial training rows;
+    threshold = ref_mean + z * ref_std / sqrt(batch_size); two flagged batches in a row raise an alert.
 
 The candidate is trained WITHOUT the newest labelled rows and scored on those same held-out rows.
-The deployed model only changes after Apply succeeds.
+The app does NOT tell the user what to do; it reports the measurement and a neutral evidence statement.
+The deployed model only changes after Update succeeds.
 """
 import copy
 import io
@@ -370,14 +370,16 @@ def build(S, name, data):
     return execute(S, plan), plan.note
 
 
-# ------------------------------------------------------------------ candidate comparison and decisions
+# ------------------------------------------------------------------ candidate comparison (evidence only)
 def compute_cands(S):
-    """Train the candidate WITHOUT the newest labelled rows and score it against the current model on those rows."""
+    """Train the candidate WITHOUT the newest labelled rows and score it against the current model on those rows.
+    Returns measurements and a neutral evidence statement; it does not recommend an action."""
     Xo, yo, Xn, yn = get_data(S)
     n = len(yn)
     if n < 2 * MIN_FIT:
         return dict(error=f"Only {n} new labelled rows: not enough to hold out an evaluation set and still "
-                          f"train (need at least {2 * MIN_FIT}). Skip for now, or lower 'Min new labelled rows'.")
+                          f"train (need at least {2 * MIN_FIT}). Keep the current model for now, or lower "
+                          "'Min new labelled rows'.")
     hold = int(np.clip(round(n * S["hold_frac"]), MIN_FIT, n - MIN_FIT))
     Xh, yh, Xt, yt = Xn.iloc[-hold:], yn[-hold:], Xn.iloc[:-hold], yn[:-hold]
     task, pos = S["task"], S["pos"]
@@ -398,7 +400,7 @@ def compute_cands(S):
     if metric.startswith("Fault-class") and not np.isfinite(mets[KEEP]["recall"]):
         metric = "Error rate"
         warns.append(f"The held-out rows contain no '{pos}' (fault) examples, so recall is undefined. "
-                     "Ranking uses error rate instead.")
+                     "Error rate is used instead.")
     rows = []
     for sp in STRATEGIES:
         if sp.name not in mets:
@@ -412,16 +414,13 @@ def compute_cands(S):
                         "Recall (fault class)": m["recall"], "F1 (fault class)": m["f1"], "Macro F1": m["macro_f1"]})
         rows.append(row)
     t = pd.DataFrame(rows)
-    keep = float(t.loc[t["Strategy"] == KEEP, "Selection score"].iloc[0])
-    t["Better than keeping (%)"] = (keep - t["Selection score"]) / keep * 100 if keep > 1e-12 else np.nan
-    valid = t[np.isfinite(t["Selection score"])].copy()
-    order = {sp.name: i for i, sp in enumerate(STRATEGIES)}
-    valid["_r"] = [(round(s, 12), 0 if nme == KEEP else 1 + order[nme]) for s, nme in
-                   zip(valid["Selection score"], valid["Strategy"])]
-    rec = valid.sort_values("_r").iloc[0]["Strategy"] if len(valid) else KEEP
+    k_s = float(t.loc[t["Strategy"] == KEEP, "Selection score"].iloc[0])
+    t["Better than keeping (%)"] = (k_s - t["Selection score"]) / k_s * 100 if k_s > 1e-12 else np.nan
+    r_s = float(t.loc[t["Strategy"] == INC, "Selection score"].iloc[0]) if INC in mets else np.nan
+
     # reliability notes
     if hold < 100:
-        warns.append(f"Only {hold} held-out rows: differences between strategies may be noise.")
+        warns.append(f"Only {hold} held-out rows: differences between the models may be noise.")
     if task == "classification":
         npos = mets[KEEP]["n_pos"]
         if npos < 10:
@@ -430,23 +429,31 @@ def compute_cands(S):
         if share > 0.95 and metric == "Error rate":
             warns.append(f"The held-out set is {share:.0%} one class; error rate can look good for a model that "
                          "never predicts the fault class. Consider the fault-class miss rate in Advanced settings.")
-    if rec != KEEP and metric in ROW_WISE:
-        d = errs[KEEP] - errs[rec]
-        se = d.std(ddof=1) / np.sqrt(len(d)) if len(d) > 1 else 0.0
-        if d.mean() <= se:
-            warns.append(f"{rec} beats the current model by less than one standard error on these rows; "
-                         "treat the difference as a tie.")
-    k_s = float(t.loc[t["Strategy"] == KEEP, "Selection score"].iloc[0])
-    r_s = float(t.loc[t["Strategy"] == rec, "Selection score"].iloc[0])
-    if rec == KEEP:
-        why = (f"**Recommended: {KEEP}.** The candidate did not have a lower held-out {metric} "
-               f"({k_s:.4f}) than the current model.")
+
+    # neutral evidence statement (no recommendation)
+    verdict = "Not measurable"
+    if np.isfinite(r_s) and np.isfinite(k_s):
+        if metric in ROW_WISE and INC in errs:
+            d = errs[KEEP] - errs[INC]                     # positive = updated model has lower error
+            se = d.std(ddof=1) / np.sqrt(len(d)) if len(d) > 1 else np.inf
+            zz = d.mean() / se if np.isfinite(se) and se > 0 else 0.0
+            verdict = ("Updated model is clearly better (more than 2 standard errors)" if zz > 2 else
+                       "Updated model is clearly worse (more than 2 standard errors)" if zz < -2 else
+                       "Difference is within noise (less than 2 standard errors)")
+        else:
+            verdict = ("Updated model scores better (no noise test for this metric)" if r_s < k_s else
+                       "Updated model scores worse (no noise test for this metric)" if r_s > k_s else
+                       "No difference")
+    rec = INC if (np.isfinite(r_s) and r_s < k_s) else KEEP    # used only for chart colour
+    if np.isfinite(r_s):
+        why = (f"Held-out {metric} on {hold:,} recent rows (lower is better): current model {k_s:.4f}, "
+               f"updated model {r_s:.4f}. **Evidence: {verdict}.** This is a measurement on recent data, "
+               "not a guarantee for future data.")
     else:
-        why = (f"**Recommended: {rec}.** It had the lowest held-out {metric} ({r_s:.4f} vs {k_s:.4f} for the current "
-               f"model) among candidates that ran successfully.")
-    why += f" This is a measurement on {hold:,} recent labelled rows, not a guarantee for future data."
+        why = f"The updated model could not be evaluated. Held-out {metric} of the current model: {k_s:.4f}."
     return dict(table=t, errs=errs, preds=preds, yh=yh, notes=notes, hold=hold, n_old=len(yo), n_new=n,
-                n_train=len(yt), failed=failed, metric=metric, warnings=warns, rec=rec, why=why)
+                n_train=len(yt), failed=failed, metric=metric, warnings=warns, rec=rec, why=why,
+                verdict=verdict, k_s=k_s, r_s=r_s)
 
 
 def apply_choice(S, name):
@@ -540,12 +547,12 @@ def confusion_fig(y, p):
 def decision_panel(S):
     c, al = S["cand"], S["alert"]
     with st.container(border=True):
-        st.subheader("Drift confirmed: choose how to adapt")
+        st.subheader("Drift confirmed: review the evidence and decide")
         if c.get("error"):
             st.error(c["error"])
-            if st.button("Skip retraining (keep current model)", key="skip_err"):
+            if st.button("Keep current model", key="skip_err"):
                 S["snooze_until"] = S["k"] + S["snooze"]
-                log(S, "Kept current model", "not enough data to evaluate candidates")
+                log(S, "Kept current model", "not enough data to evaluate the update")
                 S["alert"], S["cand"], S["bad"], S["good"] = None, None, [], 0
                 S["flash"] = ("info", "Kept the current model.")
                 st.rerun()
@@ -553,45 +560,47 @@ def decision_panel(S):
         m = st.columns(4)
         m[0].metric("Drift started at batch", al["start"] + 1)
         m[1].metric("Historical labelled rows", f"{c['n_old']:,}")
-        m[2].metric("New labelled rows", f"{c['n_new']:,}", help=f"{c['n_train']:,} used for training candidates, "
-                    f"{c['hold']:,} held out")
+        m[2].metric("New labelled rows", f"{c['n_new']:,}", help=f"{c['n_train']:,} used for training the "
+                    f"candidate, {c['hold']:,} held out")
         m[3].metric("Held-out evaluation rows", f"{c['hold']:,}")
-        t = c["table"]
-        ts = t.sort_values("Selection score").reset_index(drop=True)
-        cols = ["#9e9e9e" if s == KEEP else "#2e7d32" if s == c["rec"] else "#1f6fb2" for s in ts["Strategy"]]
-        fig = go.Figure(go.Bar(x=ts["Selection score"], y=ts["Strategy"], orientation="h", marker_color=cols,
-                               text=ts["Selection score"].round(4), textposition="auto"))
-        fig.update_layout(title=f"Held-out {c['metric']} per candidate (lower is better)", height=60 + 38 * len(ts),
-                          yaxis=dict(autorange="reversed"), margin=dict(t=45, b=30, l=10, r=10),
-                          xaxis_title=c["metric"])
-        wide(st.plotly_chart, fig)
+
         st.markdown(c["why"])
         for w in c["warnings"]:
             st.warning(w)
-        score = dict(zip(t["Strategy"], t["Selection score"]))
-        opts = [s.name for s in STRATEGIES if s.name in score and np.isfinite(score[s.name])]
+        can_update = INC in c["errs"]
+        if not can_update:
+            st.error("Continue learning could not be evaluated, so updating is disabled.")
+
+        v1, v2 = st.columns(2)
+        v1.metric(f"Current model (v{S['version']})", f"{c['k_s']:.4f}", help=f"Held-out {c['metric']}, lower is better")
+        if can_update:
+            v2.metric("After continue learning", f"{c['r_s']:.4f}", delta=f"{c['r_s'] - c['k_s']:+.4f}",
+                      delta_color="inverse", help=f"Held-out {c['metric']}, lower is better")
+        else:
+            v2.metric("After continue learning", "n/a")
+        st.caption(f"{REG[INC].blurb}  \nHow it will be built: {c['notes'].get(INC, 'n/a')}. The model that gets "
+                   "deployed learns from all new rows, including the held-out ones, so it differs slightly from "
+                   "the one measured above.")
+
         k = S["k"]
-        choice = st.radio("Strategy (held-out score in brackets)", opts, index=opts.index(c["rec"]),
-                          format_func=lambda n: f"{n}  ({score[n]:.4f})", key=f"pick_{k}")
-        st.caption(f"{REG[choice].blurb}  \nHow it will be built: {c['notes'][choice]}.")
-        a1, a2, _ = st.columns([1.2, 1.6, 3])
-        if a1.button("Apply", type="primary", disabled=choice == KEEP, key=f"apply_{k}",
-                     help="Keep Current Model is confirmed with the Skip button." if choice == KEEP else None):
-            ok, msg = apply_choice(S, choice)
+        a1, a2, _ = st.columns([1.6, 1.6, 3])
+        if a1.button("Update model (continue learning)", type="primary", disabled=not can_update, key=f"apply_{k}"):
+            ok, msg = apply_choice(S, INC)
             S["flash"] = ("success" if ok else "error", msg)
             st.rerun()
-        if a2.button("Skip retraining (keep current model)", key=f"skip_{k}"):
+        if a2.button("Keep current model", key=f"skip_{k}"):
             ok, msg = apply_choice(S, KEEP)
             S["flash"] = ("info", msg)
             st.rerun()
         if c["failed"]:
-            st.caption("Failed to build, excluded from the ranking: " + "; ".join(f"{n} ({why})" for n, why in c["failed"]))
+            st.caption("Failed to build: " + "; ".join(f"{n} ({why})" for n, why in c["failed"]))
         with st.expander("Detailed held-out metrics and confusion matrix"):
-            wide(st.dataframe, t.round(4), hide_index=True)
+            wide(st.dataframe, c["table"].round(4), hide_index=True)
             if S["task"] == "classification":
+                shown = INC if INC in c["preds"] else KEEP
                 st.caption(f"Fault class = '{S['pos']}'. Precision/recall/F1 are for that class.")
-                st.write(f"Confusion matrix: {choice}")
-                wide(st.plotly_chart, confusion_fig(c["yh"], c["preds"][choice]))
+                st.write(f"Confusion matrix: {shown}")
+                wide(st.plotly_chart, confusion_fig(c["yh"], c["preds"][shown]))
 
 
 def retrain_results(S):
@@ -641,7 +650,9 @@ def sidebar_config(S):
                         horizontal=True)
         train_pct = st.slider("Initial training %", 20, 70, 40, 5)
         B = int(st.number_input("Batch size (rows)", 20, 5000, 100))
-        sens = st.selectbox("Drift sensitivity", list(SENS), index=1)
+        sens = st.selectbox("Drift sensitivity", list(SENS), index=1,
+                            help="Threshold = reference error + z * reference std / sqrt(batch size). "
+                                 "z is 4 (Low), 3 (Medium) or 2 (High). Two batches in a row above it raise an alert.")
         delay = int(st.number_input("Label delay (batches)", 0, 20, 0))
         min_rows = int(st.number_input("Min new labelled rows before asking", 100, 100000, 300,
                                        help="After a drift alert, monitoring continues until this many post-drift "
@@ -649,7 +660,7 @@ def sidebar_config(S):
         snooze = int(st.number_input("Snooze after 'keep' (batches)", 0, 200, 10))
         with st.expander("Advanced settings"):
             hold_frac = st.slider("Share of new labelled rows held out for evaluation", 0.10, 0.40, 0.25, 0.05)
-            metric = st.selectbox("Selection metric (lower is better)", METRICS[task])
+            metric = st.selectbox("Evaluation metric (lower is better)", METRICS[task])
             pos = None
             if task == "classification":
                 tgt = df[target].dropna()
@@ -746,8 +757,8 @@ def main():
 
     if al and al["status"] == "waiting":
         st.info(f"Drift suspected since batch {al['start'] + 1}, but only {new_rows(S):,} of {S['min_rows']:,} new "
-                "labelled rows have arrived. Not enough to retrain safely, so monitoring continues. You will be asked "
-                "once there is enough data, or the alert clears itself if the error returns to normal.")
+                "labelled rows have arrived. Not enough to evaluate an update safely, so monitoring continues. You "
+                "will be asked once there is enough data, or the alert clears itself if the error returns to normal.")
 
     if ready(S):
         if S["cand"] is None:
@@ -755,7 +766,7 @@ def main():
                 try:
                     S["cand"] = compute_cands(S)
                 except Exception as exc:
-                    S["cand"] = dict(error=f"Could not evaluate candidates: {exc}")
+                    S["cand"] = dict(error=f"Could not evaluate the update: {exc}")
         decision_panel(S)
 
     if S["retrains"]:
