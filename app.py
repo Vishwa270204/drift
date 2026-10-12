@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.metrics import f1_score, precision_recall_fscore_support, confusion_matrix
+from sklearn.metrics import f1_score, precision_recall_fscore_support
 
 try:
     from river import drift as river_drift
@@ -500,6 +500,7 @@ def show_drift_chart(S):
     if S["alert"]:
         fig.add_vline(x=S["alert"]["start"] + 1, line_dash="dot", line_color="#c62828")
     fig.update_layout(
+        uirevision="model-drift-chart",
         title="Prediction error by incoming batch",
         xaxis_title="Batch",
         yaxis_title="MAE (target units)" if S["task"] == "regression" else "Error rate",
@@ -587,8 +588,8 @@ def show_history(S):
 
 
 def sidebar_config(S):
-    with st.sidebar:
-        st.header("Configuration")
+    with st.container(border=True):
+        st.subheader("Setup and configuration")
         upload = st.file_uploader("Upload labelled CSV", type=["csv"])
         if upload is None:
             return
@@ -666,8 +667,8 @@ def main():
       }
     </style>
     """, unsafe_allow_html=True)
-    st.title("📈 Model Drift Dashboard")
-    st.caption("Monitor one deployed online model and review measured evidence before updating.")
+    st.title("📈 Model Drift")
+    st.caption("Upload labelled data, monitor incoming batches, and review evidence before updating the model.")
     if not RIVER_OK:
         st.error("River is required. Install it with `pip install river` and restart the app.")
         st.stop()
@@ -676,7 +677,7 @@ def main():
     sidebar_config(S)
     S = st.session_state.get("S")
     if S is None:
-        st.info("Upload a CSV in the sidebar, select the target and click Start monitoring.")
+        st.info("Upload a labelled CSV in the setup section, choose the target column, then click Start monitoring.")
         st.stop()
 
     finished = S["k"] >= S["nb"]
