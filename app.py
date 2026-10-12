@@ -1,3 +1,4 @@
+import io
 import warnings
 
 import numpy as np
@@ -107,7 +108,15 @@ def fit_new(family, task, num, cat, classes, seed, X, y, cap=30000):
 # ------------------------------------------------------------------ data prep
 @st.cache_data(show_spinner="Reading CSV...")
 def read(data):
-    return pd.read_csv(data)
+    for enc in ("utf-8-sig", "latin-1"):
+        try:
+            out = pd.read_csv(io.BytesIO(data), encoding=enc)
+            if out.shape[1] <= 1:  # maybe a different delimiter (; or tab)
+                out = pd.read_csv(io.BytesIO(data), encoding=enc, sep=None, engine="python")
+            return out
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("Could not read the file as CSV.")
 
 
 def build_frame(df, num, cat):
