@@ -3,6 +3,7 @@ import copy
 import hashlib
 import io
 import warnings
+from contextlib import nullcontext
 
 import numpy as np
 import pandas as pd
@@ -26,7 +27,7 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 warnings.filterwarnings("ignore", message="Got `batch_size`")
 
-st.set_page_config(page_title="CSV Drift & Learning Strategy Lab", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Model Drift Monitor", page_icon="📈", layout="wide")
 
 # --------------------------------------------------------------------------------------
 # Constants
@@ -798,202 +799,775 @@ def run_simulation(stream, spec, lo, hi, B, model, policy, delay, adwin_delta, c
 
 
 # ======================================================================================
-
+# APP
 # ======================================================================================
-# SIMPLE SINGLE-PAGE DASHBOARD
-# ======================================================================================
-st.title("📈 Model Drift Monitor")
-st.caption("One page • persistent drift chart • steady incoming-data flow • alerts without automatic page refresh")
+st.title("📈 Model Drift Monitoring")
+st.caption("Upload any tabular CSV. Analyses adapt to your columns, and anything that needs labels, "
+           "a compatible model, or a source model is marked unavailable instead of being faked.")
+st.info("Drift in the *inputs* is evidence that data changed; it does not by itself prove a model got worse. "
+        "Only real target labels can show that. Replaying a static CSV is a **simulation**, not a live data connection.")
 
-st.info(
-    "This dashboard replays rows from an uploaded CSV as a stream simulation. "
-    "A drift alert does not stop incoming rows. PSI measures input-feature changes; "
-    "confirming performance/concept drift requires real target labels."
-)
-
-uploaded = st.file_uploader("Upload CSV data", type=["csv"], key="dashboard_csv")
+st.header("1. Upload your CSV")
+uploaded = st.file_uploader("CSV file", type=["csv"], key="main_csv")
 if uploaded is None:
+    st.write("Waiting for a CSV file. Nothing is generated or assumed until you upload one.")
     st.stop()
 
+data_bytes = uploaded.getvalue()
+fid = hashlib.md5(data_bytes).hexdigest()[:10]
 try:
-    df_all, info, encoding, n_dup = load_and_prepare(uploaded.getvalue())
-except Exception as exc:
-    st.error(f"Could not read this CSV: {exc}")
+    df_all, info, encoding, n_dup = load_and_prepare(data_bytes)
+except ValueError as exc:
+    st.error(str(exc))
     st.stop()
-
-if df_all.empty or len(df_all.columns) == 0:
-    st.error("The CSV must contain at least one column and one row.")
+if df_all.shape[0] == 0 or df_all.shape[1] == 0:
+    st.error("The file has no rows or no columns. Please upload a CSV with a header row and at least some data.")
     st.stop()
-
+if df_all.shape[0] < 30:
+    st.warning(f"Only {df_all.shape[0]} rows: most analyses below will be unreliable or unavailable.")
+if df_all.shape[0] > 300_000:
+    st.warning("This is a large file; model training and simulations may be slow.")
 kinds = dict(zip(info["Column"], info["Detected type"]))
 all_cols = list(df_all.columns)
 
-# Keep configuration compact and visible; no tabs or sidebar.
-with st.expander("Data and monitoring settings", expanded=True):
-    c1, c2, c3 = st.columns(3)
-    time_options = [NONE_LABEL] + [c for c in all_cols if kinds[c] in ("datetime", "datetime-text", "numeric")]
-    time_choice = c1.selectbox("Time/order column (optional)", time_options, index=0)
-    time_col = None if time_choice == NONE_LABEL else time_choice
-    target_options = [NONE_LABEL] + [c for c in all_cols if c != time_col and kinds[c] in ("numeric", "categorical", "boolean")]
-    target_choice = c2.selectbox("Target / actual outcome (optional)", target_options, index=0)
-    target = None if target_choice == NONE_LABEL else target_choice
-    features_options = [c for c in all_cols if c not in (time_col, target) and family_of(kinds[c]) is not None]
-    features = c3.multiselect("Features to monitor", features_options, default=features_options[:min(5, len(features_options))])
-    d1, d2, d3, d4 = st.columns(4)
-    batch_size = int(d1.number_input("Rows per incoming batch", min_value=10, max_value=max(10, min(10000, len(df_all))), value=max(10, min(100, len(df_all)))))
-    moderate_thr = float(d2.number_input("Moderate PSI threshold", min_value=0.01, max_value=5.0, value=0.10, step=0.01))
-    significant_thr = float(d3.number_input("Drift alert threshold", min_value=0.02, max_value=10.0, value=0.25, step=0.01))
-    bins = int(d4.number_input("PSI bins", min_value=3, max_value=20, value=10))
-    strategy = st.selectbox(
-        "Action to recommend when drift is detected",
-        ["Notify only", "Retune existing model", "Retrain using new data only", "Retrain using old + new data"],
-        help="This setting selects the response plan. The dashboard does not silently replace a production model."
-    )
-    start_button = st.button("▶ Start / refresh stream simulation", type="primary")
+# ---------------------------------------------------------------- column setup (main page)
+st.header("2. Choose columns")
+time_opts = [c for c in all_cols if kinds[c] in ("datetime", "datetime-text", "numeric")]
+auto_time = next((c for c in all_cols if kinds[c] in ("datetime", "datetime-text")), None)
+c1, c2, c3 = st.columns(3)
+time_choice = c1.selectbox(
+    "Time column (optional)", [NONE_LABEL] + time_opts,
+    index=([NONE_LABEL] + time_opts).index(auto_time) if auto_time else 0, key=f"time_{fid}",
+    help="Rows are sorted by this column. With none, the file's row order is used for drift windows.")
+time_col = None if time_choice == NONE_LABEL else time_choice
+target_choice = c2.selectbox("Target column (optional)", [NONE_LABEL] + [c for c in all_cols if c != time_col],
+                             key=f"target_{fid}", help="Real outcome labels. Without one, supervised metrics cannot be measured.")
+target = None if target_choice == NONE_LABEL else target_choice
+task = None
+if target:
+    guess = infer_task(df_all[target], kinds[target]) if kinds[target] in ("numeric", "categorical", "boolean") else "classification"
+    task = c3.radio("Task type", ["classification", "regression"], horizontal=True,
+                    index=["classification", "regression"].index(guess), key=f"task_{fid}_{target}",
+                    help=f"Auto-detected as {guess}. Change it if that is wrong.")
+else:
+    c3.caption("No target selected, so only profiling and drift analysis are available.")
 
-if significant_thr <= moderate_thr:
-    st.error("The drift alert threshold must be higher than the moderate threshold.")
-    st.stop()
-if not features:
-    st.warning("Choose at least one feature column to monitor.")
-    st.stop()
-if len(df_all) < 60:
-    st.warning("PSI comparisons are more meaningful with at least 60 rows.")
-    st.stop()
+# default feature suggestions
+excluded = {}
+suggested = []
+usable = [c for c in all_cols if c not in (target, time_col) and family_of(kinds[c]) and kinds[c] != "empty"]
+for c in all_cols:
+    if c == time_col:
+        excluded[c] = "time column"
+    elif c == target:
+        excluded[c] = "target column"
+    elif kinds[c] == "empty":
+        excluded[c] = "entirely missing"
+    elif not family_of(kinds[c]):
+        excluded[c] = f"unsupported type ({kinds[c]}); usable only as a time column"
+for c in usable:
+    r = info.set_index("Column").loc[c]
+    if r["Constant"]:
+        excluded[c] = "constant column"
+    elif r["Identifier-like"]:
+        excluded[c] = "identifier-like / very high cardinality"
+    else:
+        suggested.append(c)
+if target and kinds[target] in ("numeric", "categorical", "boolean"):
+    for c in leakage_suspects(df_all, suggested, target):
+        suggested.remove(c)
+        excluded[c] = "possible target leakage (copy of the target)"
+features = st.multiselect("Feature columns (used for drift and modelling)", usable, default=suggested, key=f"feat_{fid}",
+                          help="Suggested defaults exclude the target, time column, constants, identifiers and suspected target copies.")
+if excluded:
+    with st.expander("Columns excluded by default and why"):
+        st.dataframe(pd.DataFrame({"Column": list(excluded), "Reason": list(excluded.values())}), hide_index=True)
+row_chrono = False
+if time_col is None:
+    row_chrono = st.checkbox("My rows are already in chronological order (treat row order as time for model splits, "
+                             "concept-drift checks and the simulation)", key=f"chrono_{fid}")
+chrono = time_col is not None or row_chrono
 
+with st.expander("Modelling options (used when a target is selected)", expanded=bool(target)):
+    m1, m2, m3, m4, m5 = st.columns(5)
+    family_label = m1.selectbox("Model family", list(FAMILIES), key=f"fam_{fid}",
+                                help="Only models with partial_fit can be updated incrementally.")
+    family = FAMILIES[family_label]
+    train_pct = m2.slider("Training %", 30, 80, 50, 5, key=f"trp_{fid}")
+    adapt_pct = m3.slider("Adaptation %", 10, 40, 25, 5, key=f"adp_{fid}",
+                          help="Later labelled rows used only to update models. The remainder is the held-out test set.")
+    seed = int(m4.number_input("Random seed", 0, 9999, 42, key=f"seed_{fid}"))
+    max_train_rows = int(m5.number_input("Max training rows", 1000, 500_000, 30_000, 1000, key=f"maxrows_{fid}",
+                                         help="Larger training partitions are randomly subsampled for speed."))
+    st.caption(f"Test share = {100 - train_pct - adapt_pct}%. Splits are chronological if a time column is chosen "
+               "(or rows are declared chronological); otherwise a seeded random split is used.")
+
+# ---------------------------------------------------------------- ordered frame + supervised prep
 df_ord, tvals, n_bad_time, was_sorted = order_by_time(df_all, time_col, kinds.get(time_col))
 if df_ord.empty:
-    st.error("No usable rows remain after ordering by the selected time column.")
+    st.error("No rows have a valid value in the selected time column. Choose a different time column.")
     st.stop()
 if n_bad_time:
-    st.warning(f"{n_bad_time} rows with invalid time values were excluded from the ordered stream.")
+    st.warning(f"{n_bad_time} rows have an unparseable time value and are excluded from analyses (they remain in the CSV).")
+if time_col and not was_sorted:
+    st.info(f"Rows were re-sorted by '{time_col}' because the file was not in time order.")
 xvals = tvals if tvals is not None else pd.Series(np.arange(len(df_ord)))
-ref_n = max(30, int(len(df_ord) * 0.4))
-ref_n = min(ref_n, len(df_ord) - 20)
-reference = df_ord.iloc[:ref_n][features].reset_index(drop=True)
-stream = df_ord.iloc[ref_n:].reset_index(drop=True)
-if len(stream) < 1:
-    st.warning("Not enough rows remain for the stream after reserving reference data.")
-    st.stop()
+n_rows = len(df_ord)
 
-spec = build_reference(reference, list(features), kinds, bins)
-if not spec:
-    st.error("No supported numeric or categorical feature columns have valid reference values.")
-    st.stop()
+has_target = target is not None
+sup_problems, perf = [], None
+num_cols = tuple(f for f in features if family_of(kinds[f]) == "num")
+cat_cols_all = [f for f in features if family_of(kinds[f]) == "cat"]
+cat_cols = tuple(f for f in cat_cols_all if df_ord[f].nunique() <= MAX_ONEHOT)
+dropped_cat = [f for f in cat_cols_all if f not in cat_cols]
+lf = y_arr = X_model = x_lab = None
+if has_target:
+    if kinds[target] in ("empty", "datetime", "datetime-text"):
+        sup_problems.append(f"Target '{target}' has type '{kinds[target]}', which cannot be used as a target.")
+    else:
+        lab_mask = df_ord[target].notna().to_numpy()
+        lf = df_ord.loc[lab_mask].reset_index(drop=True)
+        x_lab = xvals[lab_mask].reset_index(drop=True)
+        if task == "regression":
+            if kinds[target] != "numeric":
+                sup_problems.append("Regression needs a numeric target; choose 'classification' or another column.")
+            else:
+                y_arr = lf[target].astype(float).to_numpy()
+        else:
+            y_arr = lf[target].astype(str).to_numpy()
+            ncls = len(np.unique(y_arr))
+            if ncls < 2:
+                sup_problems.append("The target has fewer than two distinct values, so classification is impossible.")
+            elif ncls > 50:
+                sup_problems.append(f"The target has {ncls} classes. That is more than this app supports; consider regression or binning.")
+        if not sup_problems:
+            if len(lf) < 60:
+                sup_problems.append(f"Only {len(lf)} labelled rows (need at least 60 for a train/adaptation/test split).")
+            if train_pct + adapt_pct > 90:
+                sup_problems.append("Training % + adaptation % must not exceed 90 (the test set needs at least 10%).")
+            if not num_cols and not cat_cols:
+                sup_problems.append("No usable feature columns are selected for modelling.")
+    if not sup_problems:
+        X_model = model_frame(lf, list(num_cols), list(cat_cols))
+        sig_base = "|".join(map(str, [fid, time_col, target, task, num_cols, cat_cols, family, train_pct, adapt_pct,
+                                      seed, chrono, max_train_rows]))
+        try:
+            perf = train_baseline(X_model, y_arr, x_lab, sig_base, family, task, num_cols, cat_cols, chrono,
+                                  train_pct, adapt_pct, seed, max_train_rows)
+            if len(perf["parts"][2]) < 10 or len(perf["parts"][0]) < 20:
+                perf = None
+                sup_problems.append("The held-out test (or training) partition is too small. Adjust the split percentages.")
+        except Exception as exc:
+            perf = None
+            sup_problems.append(f"Baseline training failed: {exc}")
+exports = {}
+drift_summary = None
 
-# Process once per explicit click; charts stay stable between interactions and no timer/rerun loop is used.
-sig = hashlib.md5((uploaded.name + str(len(uploaded.getvalue())) + str(features) +
-                   str(batch_size) + str(moderate_thr) + str(significant_thr) + str(bins) +
-                   str(strategy) + str(time_col)).encode()).hexdigest()
-if start_button or st.session_state.get("simple_dashboard_sig") != sig:
-    records = []
-    alerts = []
-    for batch_no, start in enumerate(range(0, len(stream), batch_size), start=1):
-        chunk = stream.iloc[start:start + batch_size]
-        vals = {}
-        for col, entry in spec.items():
-            vals[col] = psi_value(entry[2], counts_for(entry, chunk[col]))[0]
-        valid = {col: value for col, value in vals.items() if not np.isnan(value)}
-        max_psi = max(valid.values()) if valid else np.nan
-        top_feature = max(valid, key=valid.get) if valid else "N/A"
-        status = status_of(max_psi, moderate_thr, significant_thr)
-        records.append({
-            "Batch": batch_no, "Rows received": min(start + len(chunk), len(stream)),
-            "Batch size": len(chunk), "Max PSI": max_psi,
-            "Mean PSI": float(np.mean(list(valid.values()))) if valid else np.nan,
-            "Top feature": top_feature, "Status": status
-        })
-        if status == "Significant":
-            alerts.append({
-                "Batch": batch_no, "Status": "DRIFT DETECTED",
-                "Feature": top_feature, "Max PSI": max_psi,
-                "Recommended action": strategy
-            })
-    st.session_state["simple_dashboard_sig"] = sig
-    st.session_state["simple_dashboard_batches"] = pd.DataFrame(records)
-    st.session_state["simple_dashboard_alerts"] = pd.DataFrame(
-        alerts, columns=["Batch", "Status", "Feature", "Max PSI", "Recommended action"]
-    )
+# ---------------------------------------------------------------- tabs
+# Single-page layout: keep section blocks in flow without rendering navigation tabs.
+tabs = [nullcontext() for _ in range(7)]
 
-batches = st.session_state["simple_dashboard_batches"]
-alerts = st.session_state["simple_dashboard_alerts"]
+# ======================================================= Overview
+with tabs[0]:
+    st.subheader("Dataset overview")
+    n_num = sum(kinds[c] == "numeric" for c in all_cols)
+    n_cat = sum(kinds[c] in ("categorical", "boolean") for c in all_cols)
+    a, b, c, d = st.columns(4)
+    a.metric("Rows", f"{len(df_all):,}")
+    b.metric("Columns", f"{len(all_cols):,}")
+    c.metric("Numeric / categorical columns", f"{n_num} / {n_cat}")
+    d.metric("Time ordering", time_col if time_col else ("row order (declared chronological)" if row_chrono else "row order"))
+    st.markdown(f"**Target:** {target or 'none'}" + (f" ({task})" if target else "") +
+                f"  \n**Features selected:** {len(features)}" +
+                (f"  \n**High-cardinality categorical features excluded from the model (still used for drift):** {', '.join(dropped_cat)}" if dropped_cat else ""))
 
-st.divider()
-st.subheader("Live data flow")
-st.caption(f"Reference window: first {len(reference):,} rows • Simulated incoming stream: {len(stream):,} rows • {len(batches):,} batches")
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Rows in CSV", f"{len(df_all):,}")
-k2.metric("Incoming batches", f"{len(batches):,}")
-k3.metric("Drift alerts", f"{len(alerts):,}")
-k4.metric("Latest status", batches.iloc[-1]["Status"] if len(batches) else "Waiting")
+    st.subheader("What can be analysed with this setup?")
+    stream_len = len(perf["stream"]) if perf and perf["stream"] is not None else 0
+    checklist = [
+        ("Data profiling & quality", "Available", "Works on any CSV."),
+        ("Feature drift (PSI)", "Available" if features and n_rows >= 60 else "Unavailable",
+         "Select feature columns and have at least 60 rows." if not (features and n_rows >= 60) else "Compares two row windows."),
+        ("Supervised baseline model", "Available" if perf else "Unavailable",
+         "Real target labels are used." if perf else (" ".join(sup_problems) if sup_problems else "No target column selected, so there are no ground-truth labels.")),
+        ("Concept-drift / performance over time", "Available" if perf and chrono and stream_len >= 100 else "Unavailable",
+         "Needs labels, chronological order and enough post-training rows." if not (perf and chrono and stream_len >= 100) else "Frozen baseline monitored on later rows."),
+        ("Update-strategy comparison", "Available" if perf else "Unavailable",
+         "Incremental/online/continual need a model with partial_fit; transfer needs a source CSV." if perf else "Needs a valid target and baseline model."),
+        ("Live-stream simulation", "Available" if chrono and n_rows >= 100 else "Unavailable",
+         ("Feature drift only (no target)." if not perf else "Feature drift plus performance.") if chrono and n_rows >= 100 else "Needs chronological order and at least 100 rows."),
+    ]
+    st.dataframe(pd.DataFrame(checklist, columns=["Analysis", "Status", "Notes"]), hide_index=True)
 
-# Flow chart is always shown; the stream is not stopped or reset by an alert.
-flow_fig = go.Figure()
-flow_fig.add_trace(go.Scatter(
-    x=batches["Batch"], y=batches["Rows received"], mode="lines+markers",
-    name="Rows received", line=dict(width=3)
-))
-flow_fig.update_layout(
-    title="Incoming data continues normally",
-    xaxis_title="Stream batch", yaxis_title="Cumulative rows received",
-    height=300, margin=dict(l=20, r=20, t=55, b=20)
-)
-st.plotly_chart(flow_fig, use_container_width=True, key="incoming_flow_chart")
+    st.subheader("Data drift versus concept drift")
+    st.markdown("""
+- **Data (covariate) drift:** the distribution of *input features* changes. It can be measured without labels, e.g. with PSI.
+- **Concept drift:** the *relationship between inputs and the target* changes. It can only be confirmed with real labels,
+  for example by seeing prediction errors grow over time.
+- PSI alone **cannot** detect concept drift, and feature drift does not always hurt performance. Labels are often delayed;
+  until they arrive, actual performance is unknown.
+""")
 
-st.subheader("Model / data drift graph")
-drift_fig = go.Figure()
-drift_fig.add_trace(go.Scatter(
-    x=batches["Batch"], y=batches["Max PSI"], mode="lines+markers",
-    name="Maximum feature PSI", line=dict(width=3),
-    marker=dict(color=[STATUS_COLORS.get(s, "#888888") for s in batches["Status"]], size=8)
-))
-drift_fig.add_trace(go.Scatter(
-    x=batches["Batch"], y=batches["Mean PSI"], mode="lines",
-    name="Mean feature PSI", line=dict(dash="dot")
-))
-drift_fig.add_hline(y=moderate_thr, line_dash="dash", annotation_text="Moderate threshold")
-drift_fig.add_hline(y=significant_thr, line_dash="dash", annotation_text="Alert threshold")
-drift_fig.update_layout(
-    title="Feature drift by incoming batch",
-    xaxis_title="Stream batch", yaxis_title="PSI",
-    height=380, margin=dict(l=20, r=20, t=55, b=20),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-)
-st.plotly_chart(drift_fig, use_container_width=True, key="drift_chart")
+# ======================================================= Data Quality
+with tabs[1]:
+    st.subheader("Data quality")
+    miss_cells = int(df_all.isna().sum().sum())
+    a, b, c, d, e = st.columns(5)
+    a.metric("Rows", f"{len(df_all):,}")
+    b.metric("Columns", len(all_cols))
+    c.metric("Duplicate rows", f"{n_dup:,}", f"{100 * n_dup / len(df_all):.1f}%", delta_color="off")
+    d.metric("Missing cells", f"{100 * miss_cells / max(df_all.size, 1):.2f}%")
+    e.metric("Constant columns", int(info["Constant"].sum()))
+    st.caption(f"Encoding read as {encoding}. Duplicates are counted but not removed. Missing values are never filled in the "
+               "displayed data; models impute using training data only.")
+    warns = []
+    if (info["Detected type"] == "empty").any():
+        warns.append("Entirely empty columns: " + ", ".join(info.loc[info["Detected type"] == "empty", "Column"]))
+    if info["Constant"].any():
+        warns.append("Constant columns carry no information: " + ", ".join(info.loc[info["Constant"], "Column"]))
+    if info["Identifier-like"].any():
+        warns.append("Identifier-like columns (excluded from features by default): " + ", ".join(info.loc[info["Identifier-like"], "Column"]))
+    noted = info[info["Notes"].str.contains("non-numeric|infinite", regex=True)]
+    for _, r in noted.iterrows():
+        warns.append(f"'{r['Column']}': {r['Notes']}")
+    for w in warns:
+        st.warning(w)
+    st.markdown("**Column profile**")
+    st.dataframe(info, hide_index=True)
+    exports["column_profile.csv"] = info
+    st.markdown("**Data preview (first 50 rows)**")
+    st.dataframe(df_all.head(50))
 
-st.subheader("Drift notification")
-if len(alerts):
-    latest = alerts.iloc[-1]
-    st.error(
-        f"⚠️ Drift detected in batch {int(latest['Batch'])}: feature **{latest['Feature']}** "
-        f"(maximum PSI = {latest['Max PSI']:.3f}). Incoming data continues. "
-        f"Suggested response: **{latest['Recommended action']}**."
-    )
-    st.dataframe(alerts.tail(10), hide_index=True, use_container_width=True)
-else:
-    st.success("No significant feature drift detected in the current replay. Monitoring continues.")
+    num_list = [c for c in all_cols if kinds[c] == "numeric"]
+    cat_list = [c for c in all_cols if kinds[c] in ("categorical", "boolean")]
+    if num_list:
+        st.markdown("**Numerical summary**")
+        st.dataframe(df_all[num_list].describe().T)
+    if cat_list:
+        st.markdown("**Categorical summary**")
+        rows = []
+        for c in cat_list:
+            vc = df_all[c].astype(str).where(df_all[c].notna()).value_counts()
+            rows.append({"Column": c, "Unique": int(df_all[c].nunique()), "Most frequent": vc.index[0] if len(vc) else "",
+                         "Most frequent (%)": round(100 * vc.iloc[0] / max(vc.sum(), 1), 2) if len(vc) else 0})
+        st.dataframe(pd.DataFrame(rows), hide_index=True)
+    left, right = st.columns(2)
+    with left:
+        miss_df = info[info["Missing"] > 0].sort_values("Missing (%)", ascending=False)
+        if len(miss_df):
+            fig = px.bar(miss_df, x="Missing (%)", y="Column", orientation="h", title="Missing values by column",
+                         hover_data=["Missing"])
+            fig.update_layout(yaxis=dict(autorange="reversed"), height=max(300, 28 * len(miss_df) + 100))
+            # Graph omitted to keep the dashboard focused.
+        else:
+            st.success("No missing values.")
+    with right:
+        if cat_list:
+            fig = px.bar(info[info["Column"].isin(cat_list)], x="Column", y="Unique", title="Unique values per categorical column")
+            # Graph omitted to keep the dashboard focused.
+    if cat_list:
+        pick = st.selectbox("Inspect value counts for", cat_list, key=f"vc_{fid}")
+        vc = df_all[pick].astype(str).where(df_all[pick].notna()).value_counts().head(25).reset_index()
+        vc.columns = [pick, "Count"]
+        # Graph omitted to keep the dashboard focused.
 
-st.subheader("Response strategy")
-strategy_notes = {
-    "Notify only": "Keep the current model unchanged, investigate the changed inputs, and continue monitoring.",
-    "Retune existing model": "Try a controlled hyperparameter search on recent labelled data. Compare the tuned candidate against the current model on a separate validation set.",
-    "Retrain using new data only": "Train a candidate on recent labelled data. Use this when the new regime is representative and older patterns are no longer useful; check for forgetting.",
-    "Retrain using old + new data": "Train a candidate on a balanced mixture of historical and recent labelled data. This is a safer starting point when both old and new patterns may matter."
-}
-st.markdown(f"**Selected plan: {strategy}.** {strategy_notes[strategy]}")
-st.caption(
-    "Important: PSI detects changes in input distributions, not proof of worse predictions. "
-    + ("Select a target and use real arriving labels to evaluate accuracy/error before approving a model change."
-       if target else "No target was selected, so this dashboard cannot calculate model accuracy or confirm concept drift.")
-)
-st.subheader("Batch history")
-st.dataframe(batches, hide_index=True, use_container_width=True)
-st.download_button(
-    "Download drift batch history",
-    csv_bytes(batches), "drift_batch_history.csv", "text/csv"
-)
-if len(alerts):
-    st.download_button(
-        "Download drift alerts",
-        csv_bytes(alerts), "drift_alerts.csv", "text/csv"
-    )
+# ======================================================= Drift Detection
+with tabs[2]:
+    st.subheader("Feature drift (Population Stability Index)")
+    st.markdown("Compares each feature's distribution in an **earlier reference window** with a **later comparison window**. "
+                "This is evidence about *inputs* only. See the Model Performance tab for whether predictions got worse.")
+    drift_cols = list(features)
+    if has_target and kinds.get(target) in ("numeric", "categorical", "boolean"):
+        if st.checkbox("Also check the target column itself (label / prior drift)", key=f"dtarget_{fid}"):
+            drift_cols.append(target)
+    if not drift_cols or n_rows < 60:
+        st.warning("Select at least one feature column and provide at least 60 rows to run drift detection.")
+    else:
+        w1, w2, w3 = st.columns(3)
+        ref_rng = w1.slider("Reference window (% of rows)", 0, 100, (0, 50), key=f"ref_{fid}",
+                            help="Percentages of the time-ordered rows.")
+        cmp_rng = w2.slider("Comparison window (% of rows)", 0, 100, (50, 100), key=f"cmp_{fid}")
+        n_bins = int(w3.number_input("Numeric bins (quantiles of the reference window)", 3, 30, 10, key=f"bins_{fid}"))
+        t1, t2 = st.columns(2)
+        thr_lo = float(t1.number_input("Moderate-drift threshold (PSI ≥)", 0.01, 5.0, 0.10, 0.01, key=f"tlo_{fid}"))
+        thr_hi = float(t2.number_input("Significant-drift threshold (PSI ≥)", 0.02, 10.0, 0.25, 0.01, key=f"thi_{fid}"))
+        st.caption(f"PSI < {thr_lo}: stable. {thr_lo} to < {thr_hi}: moderate shift. ≥ {thr_hi}: significant shift. "
+                   "These are common rules of thumb, not statistical tests, and PSI is inflated for small windows. "
+                   "Missing values form their own bin; categories not seen in the reference window fall into 'Other / unseen'.")
+        ra, rb = int(n_rows * ref_rng[0] / 100), int(n_rows * ref_rng[1] / 100)
+        ca, cb = int(n_rows * cmp_rng[0] / 100), int(n_rows * cmp_rng[1] / 100)
+        if thr_hi <= thr_lo:
+            st.error("The significant threshold must be larger than the moderate threshold.")
+        elif ra < cb and ca < rb:
+            st.error("The reference and comparison windows overlap. Adjust them so they cover different rows.")
+        elif rb - ra < 30 or cb - ca < 30:
+            st.error("Each window needs at least 30 rows.")
+        else:
+            if min(rb - ra, cb - ca) < 100:
+                st.warning("A window has fewer than 100 rows; PSI values will be noisy.")
+            ref_df, cmp_df = df_ord.iloc[ra:rb], df_ord.iloc[ca:cb]
+            drift_res, drift_det = compute_drift(ref_df, cmp_df, drift_cols, kinds, n_bins, thr_lo, thr_hi)
+            exports["drift_results.csv"] = drift_res
+            counts = drift_res["Status"].value_counts()
+            evaluated = drift_res[drift_res["Status"] != "N/A"]
+            n_sig, n_mod = int(counts.get("Significant", 0)), int(counts.get("Moderate", 0))
+            max_psi = float(evaluated["PSI"].max()) if len(evaluated) else np.nan
+            drift_summary = {"max_psi": max_psi, "n_sig": n_sig, "n_mod": n_mod,
+                             "status": status_of(max_psi, thr_lo, thr_hi)}
+            st.markdown(f"Reference: rows {ra:,}–{rb:,} ({rb - ra:,} rows). Comparison: rows {ca:,}–{cb:,} ({cb - ca:,} rows)"
+                        + (f", {xvals.iloc[ra]} → {xvals.iloc[rb - 1]} vs {xvals.iloc[ca]} → {xvals.iloc[cb - 1]}." if time_col else "."))
+            a, b, c, d = st.columns(4)
+            a.metric("Features evaluated", len(evaluated))
+            b.metric("Significant drift", n_sig)
+            c.metric("Moderate drift", n_mod)
+            d.metric("Max PSI", f"{max_psi:.3f}" if not np.isnan(max_psi) else "n/a")
+            if not len(evaluated):
+                st.warning("No feature could be evaluated (reference window has no valid values).")
+            elif n_sig == 0 and n_mod == 0:
+                st.success("No notable feature-level drift between the selected windows. The distributions look similar.")
+            else:
+                top = evaluated.head(3)
+                total_psi = evaluated["PSI"].sum()
+                st.warning(f"Feature drift detected in {n_sig + n_mod} of {len(evaluated)} features. Largest contributors: "
+                           + ", ".join(f"**{r.Feature}** (PSI {r.PSI:.3f}, {100 * r.PSI / total_psi:.0f}% of total)"
+                                       for r in top.itertuples()))
+            st.caption("Feature drift is evidence that inputs changed. It does not prove that model performance degraded.")
+            if len(evaluated):
+                fig = px.bar(evaluated, x="PSI", y="Feature", orientation="h", color="Status",
+                             color_discrete_map=STATUS_COLORS, title="PSI by feature",
+                             hover_data=["Share of total PSI (%)"])
+                for thr, nm in ((thr_lo, "moderate"), (thr_hi, "significant")):
+                    fig.add_vline(x=thr, line_dash="dot", annotation_text=nm, annotation_position="top")
+                fig.update_layout(yaxis=dict(autorange="reversed"), height=max(320, 26 * len(evaluated) + 120))
+                st.plotly_chart(fig)
+            st.dataframe(drift_res.round(4), hide_index=True)
+            st.download_button("Download drift results (CSV)", csv_bytes(drift_res), "drift_results.csv", "text/csv")
+            if len(evaluated):
+                feat = st.selectbox("Compare distributions for", list(evaluated["Feature"]), key=f"dfeat_{fid}")
+                is_num = family_of(kinds[feat]) == "num"
+                if is_num:
+                    pdf = pd.concat([ref_df[[feat]].assign(Window="Reference"), cmp_df[[feat]].assign(Window="Comparison")])
+                    fig = px.histogram(pdf.dropna(), x=feat, color="Window", barmode="overlay", opacity=0.6,
+                                       histnorm="probability density", nbins=40, title=f"Distribution of '{feat}'",
+                                       color_discrete_map={"Reference": "#1f77b4", "Comparison": "#ff7f0e"})
+                    fig.update_yaxes(title="Density")
+                else:
+                    det = drift_det[feat].melt(id_vars=["Bin", "PSI contribution"], value_vars=["Reference (%)", "Comparison (%)"],
+                                               var_name="Window", value_name="Share (%)")
+                    fig = px.bar(det, x="Bin", y="Share (%)", color="Window", barmode="group", title=f"Category shares for '{feat}'")
+                # Graph omitted to keep the dashboard focused.
+                with st.expander("Per-bin PSI contributions"):
+                    st.dataframe(drift_det[feat].round(4), hide_index=True)
+
+# ======================================================= Model Performance
+with tabs[3]:
+    st.subheader("Baseline model performance")
+    if not has_target:
+        st.info("No target column was selected, so supervised model performance **cannot be measured**. "
+                "No labels or actual values are invented. Profiling and PSI drift analysis remain available.")
+    elif perf is None:
+        st.warning("Supervised analysis is not available:\n\n" + "\n".join(f"- {p}" for p in sup_problems))
+    else:
+        tr, ad, te = perf["parts"]
+        yte = y_arr[te]
+        st.markdown(f"**Model:** {FAMILY_NAME[family]} · **Task:** {task} · **Features:** {len(num_cols)} numeric + "
+                    f"{len(cat_cols)} categorical (one-hot). Preprocessing (imputation, scaling, encoding) is fitted on the training partition only. "
+                    f"The target and time column are never used as features.")
+        if dropped_cat:
+            st.caption("Excluded from the model because of very many categories: " + ", ".join(dropped_cat))
+        if len(lf) < len(df_ord):
+            st.caption(f"{len(df_ord) - len(lf):,} rows with a missing target are excluded from supervised analysis.")
+        split_txt = "chronological" if chrono else "seeded random (stratified for classification where possible)"
+        st.markdown(f"**Split ({split_txt}):** training {len(tr):,} (model fitted on {len(perf['tr_fit']):,}) · "
+                    f"adaptation {len(ad):,} (unused by the baseline) · held-out test {len(te):,}")
+        if not chrono:
+            st.warning("No chronological order was declared, so the split is random. Performance-over-time and drift-adaptation "
+                       "conclusions are not available because earlier/later rows are mixed.")
+        mt, mtr, nv = perf["metrics_test"], perf["metrics_train"], perf["naive_metrics"]
+        comp = pd.DataFrame({"Held-out test": mt, "Training (in-sample)": mtr, f"Naive reference ({perf['naive_desc']})": nv}).T
+        st.dataframe(comp.round(4))
+        exports["baseline_test_predictions.csv"] = pd.DataFrame({"row_in_labelled_data": te, "actual": yte, "predicted": perf["pred_test"]})
+        if task == "regression":
+            ok = mt["RMSE"] < nv["RMSE"]
+            st.markdown(f"**Summary:** on {len(te):,} unseen test rows the baseline has MAE {mt['MAE']:.4g}, RMSE {mt['RMSE']:.4g}, "
+                        f"R² {mt['R²']:.3f}. The naive reference has RMSE {nv['RMSE']:.4g}, so the model is "
+                        f"{'better' if ok else 'not better'} than that reference on RMSE.")
+            l, r = st.columns(2)
+            fig = px.scatter(x=yte, y=perf["pred_test"], labels={"x": "Actual", "y": "Predicted"}, title="Actual vs predicted (test)",
+                             opacity=0.6)
+            lim = [float(min(yte.min(), perf["pred_test"].min())), float(max(yte.max(), perf["pred_test"].max()))]
+            fig.add_trace(go.Scatter(x=lim, y=lim, mode="lines", name="Perfect prediction", line=dict(dash="dash", color="gray")))
+            # Graph omitted to keep the dashboard focused.
+            if chrono:
+                fig = go.Figure()
+                xt = x_lab.iloc[te]
+                fig.add_trace(go.Scatter(x=xt, y=yte, mode="lines", name="Actual"))
+                fig.add_trace(go.Scatter(x=xt, y=perf["pred_test"], mode="lines", name="Predicted"))
+                fig.update_layout(title="Actual and predicted over the test period", xaxis_title="Time / row", yaxis_title=target)
+            else:
+                fig = px.histogram(x=yte - perf["pred_test"], nbins=40, labels={"x": "Residual (actual - predicted)"}, title="Residual distribution (test)")
+            # Graph omitted to keep the dashboard focused.
+        else:
+            maj = nv["Accuracy"]
+            st.markdown(f"**Summary:** on {len(te):,} unseen test rows accuracy is {mt['Accuracy']:.3f} and weighted F1 {mt['F1 (weighted)']:.3f}. "
+                        f"The majority-class reference reaches accuracy {maj:.3f}; "
+                        f"{'the model beats it' if mt['Accuracy'] > maj else 'the model does not beat it'}.")
+            labs = sorted(set(yte) | set(perf["pred_test"]))
+            l, r = st.columns(2)
+            if len(labs) <= 30:
+                cm = confusion_matrix(yte, perf["pred_test"], labels=labs)
+                fig = px.imshow(cm, x=labs, y=labs, text_auto=True, color_continuous_scale="Blues",
+                                labels=dict(x="Predicted", y="Actual", color="Count"), title="Confusion matrix (test)")
+                # Graph omitted to keep the dashboard focused.
+            p, rc, f1, sup = precision_recall_fscore_support(yte, perf["pred_test"], labels=labs, zero_division=0)
+            rep = pd.DataFrame({"Class": labs, "Precision": p, "Recall": rc, "F1": f1, "Support": sup})
+            r.dataframe(rep.round(3), hide_index=True)
+            dist = pd.concat([pd.DataFrame({"Class": y_arr[tr]}).assign(Partition="Training"),
+                              pd.DataFrame({"Class": yte}).assign(Partition="Test")])
+            dist = dist.groupby(["Partition", "Class"]).size().reset_index(name="Count")
+            # Graph omitted to keep the dashboard focused.
+        st.caption("With small test sets these metrics have real sampling uncertainty; compare with the naive reference rather than trusting a single number.")
+
+        # ---------------- concept drift
+        st.divider()
+        st.subheader("Concept drift, delayed labels and performance over time")
+        st.markdown("""
+The baseline model is **frozen** and monitored on the rows that come after its training data.
+Rising errors can signal concept drift, but also covariate shift, noise or label problems; the data alone cannot separate these
+causes. Detection requires **real labels**, **chronological order**, and enough rows. Labels often arrive late, so measured performance only covers rows whose labels have arrived.
+""")
+        stream = perf["stream"]
+        if not chrono or stream is None:
+            st.info("Declare chronological order (choose a time column or tick the row-order option) to monitor performance over time.")
+        elif len(stream) < 100:
+            st.info("Fewer than 100 post-training labelled rows: not enough to monitor performance over time reliably.")
+        else:
+            delay = int(st.number_input("Label delay (most recent rows whose labels have NOT arrived yet)", 0, max(len(stream) - 100, 0),
+                                        0, key=f"delay_{fid}"))
+            avail = stream.iloc[:len(stream) - delay].reset_index(drop=True)
+            st.caption(f"Measurable rows: {len(avail):,} of {len(stream):,}. "
+                       + ("With delayed labels, performance on the latest rows is unknown until they arrive." if delay else "No label delay assumed."))
+            k_max = max(2, min(10, len(avail) // 30))
+            K = st.slider("Number of evaluation windows", 2, k_max, min(5, k_max), key=f"K_{fid}")
+            edges = np.linspace(0, len(avail), K + 1).astype(int)
+            wrows = []
+            for i in range(K):
+                w = avail.iloc[edges[i]:edges[i + 1]]
+                lo_c, hi_c = mean_ci(w["error"].to_numpy(), seed=seed + i)
+                mtw = compute_metrics(task, w["y_true"], w["y_pred"])
+                wrows.append({"Window": f"W{i + 1}", "From": w["x"].iloc[0], "To": w["x"].iloc[-1], "Rows": len(w),
+                              "Mean error" if task == "regression" else "Error rate": w["error"].mean(),
+                              "CI low": lo_c, "CI high": hi_c,
+                              **({"RMSE": mtw["RMSE"]} if task == "regression" else {"Accuracy": mtw["Accuracy"], "F1 (weighted)": mtw["F1 (weighted)"]})})
+            wdf = pd.DataFrame(wrows)
+            exports["performance_by_window.csv"] = wdf
+            st.dataframe(wdf.round({c: 4 for c in wdf.columns if pd.api.types.is_float_dtype(wdf[c])}), hide_index=True)
+            ycol = "Mean error" if task == "regression" else "Error rate"
+            fig = go.Figure(go.Scatter(x=wdf["Window"], y=wdf[ycol], mode="lines+markers", name=ycol,
+                                       error_y=dict(type="data", symmetric=False, array=wdf["CI high"] - wdf[ycol],
+                                                    arrayminus=wdf[ycol] - wdf["CI low"])))
+            fig.update_layout(title=f"{ycol} per evaluation window (95% bootstrap CI)", xaxis_title="Window (chronological)",
+                              yaxis_title="MAE" if task == "regression" else "Error rate")
+            # Graph omitted to keep the dashboard focused.
+            e1, e2 = avail["error"].to_numpy()[edges[0]:edges[1]], avail["error"].to_numpy()[edges[-2]:edges[-1]]
+            rng = np.random.default_rng(seed)
+            diff = (e2[rng.integers(0, len(e2), (500, len(e2)))].mean(axis=1) - e1[rng.integers(0, len(e1), (500, len(e1)))].mean(axis=1))
+            dlo, dhi = np.percentile(diff, [2.5, 97.5])
+            if dlo > 0:
+                verdict = "Error is **higher** in the last window than in the first (the 95% interval excludes 0)."
+            elif dhi < 0:
+                verdict = "Error is **lower** in the last window than in the first (the 95% interval excludes 0)."
+            else:
+                verdict = "There is **no clear difference** in error between the first and last windows (the 95% interval includes 0)."
+            st.markdown(f"{verdict} Difference in mean error (last − first): {e2.mean() - e1.mean():.4g}, 95% CI [{dlo:.4g}, {dhi:.4g}], "
+                        f"with {len(e1):,} and {len(e2):,} rows. This is evidence about performance, not proof of *why* it changed.")
+            if drift_summary:
+                worse = dlo > 0
+                feat_drift = drift_summary["status"] in ("Moderate", "Significant")
+                interp = {(True, True): "Errors rose **and** input features drifted: consistent with data drift, possibly with concept drift too. The two cannot be separated from this evidence alone.",
+                          (True, False): "Errors rose **without** notable feature drift: this pattern is more suggestive of concept drift, label noise or an unmeasured factor.",
+                          (False, True): "Features drifted but no clear error increase was measured: data drift without demonstrated performance impact (so far).",
+                          (False, False): "Neither notable feature drift nor a clear error increase was found."}[(worse, feat_drift)]
+                st.info(interp)
+            st.markdown("**ADWIN-style change detector on the prediction-error stream**")
+            delta = st.select_slider("Confidence parameter δ (smaller = fewer false alarms, slower detection)",
+                                     [0.0005, 0.001, 0.002, 0.005, 0.01, 0.05], value=0.002, key=f"delta_{fid}")
+            ne = normalize_errors(task, avail["error"].to_numpy(), max(30, len(avail) // 5))
+            hits = run_adwin(ne, delta)
+            roll_w = max(10, len(avail) // 40)
+            roll = avail["error"].rolling(roll_w, min_periods=max(3, roll_w // 3)).mean()
+            fig = go.Figure(go.Scatter(x=avail["x"], y=roll, mode="lines", name=f"Rolling error (window {roll_w})"))
+            for h in hits[:15]:
+                vline(fig, avail["x"].iloc[h], "change")
+            fig.update_layout(title="Frozen-baseline error over time with detected changes", xaxis_title="Time / row",
+                              yaxis_title="Rolling mean absolute error" if task == "regression" else "Rolling error rate")
+            # Graph omitted to keep the dashboard focused.
+            if hits:
+                hdf = pd.DataFrame({"Detection #": range(1, len(hits) + 1), "Stream row": hits, "Time / row": [avail["x"].iloc[h] for h in hits],
+                                    "Partition": [avail["Partition"].iloc[h] for h in hits],
+                                    "Earliest label-confirmed at stream row": [h + delay for h in hits]})
+                st.warning(f"The detector signalled {len(hits)} change point(s) in the error stream. This suggests the error level changed; "
+                           "confirm with a fresh labelled sample before acting.")
+                st.dataframe(hdf, hide_index=True)
+                exports["adwin_detections.csv"] = hdf
+            else:
+                st.success("No change in the error stream was detected at this sensitivity.")
+            with st.expander("Detector requirements and limitations"):
+                st.markdown("""
+- Needs **ground-truth labels** for each monitored row, in chronological order; with delayed labels it can only react after they arrive.
+- Works on a **bounded** signal: classification uses 0/1 errors; regression uses absolute errors scaled by 4× the early mean error and clipped to [0, 1].
+- This is a **simplified** ADWIN-style implementation (bounded window, checks every few rows, variance-aware bound), not the reference library.
+- It needs hundreds of labelled rows to detect modest shifts, and gives false alarms at the rate implied by δ only if the assumptions hold.
+- It detects a change in *error level*, which can be caused by concept drift, covariate shift or noise. It cannot tell you which.
+""")
+
+# ======================================================= Learning Strategy Comparison
+with tabs[4]:
+    st.subheader("Compare model-update strategies")
+    if perf is None:
+        st.info("Strategy comparison needs real target labels and a trained baseline. "
+                + ("No target column was selected." if not has_target else "See the Model Performance tab for what is blocking it."))
+    else:
+        tr, ad, te = perf["parts"]
+        if len(ad) < 20 or len(te) < 20:
+            st.warning("The adaptation or test partition has fewer than 20 rows; comparisons would be meaningless. Adjust the split percentages.")
+        else:
+            st.markdown("""
+All strategies start from the **same trained baseline** (where applicable), update only on the **adaptation** rows,
+and are scored on the **same held-out test rows**, which no strategy sees.
+- **Incremental:** `partial_fit` on adaptation mini-batches. **Online:** one row at a time.
+- **Continual (replay):** new batches are mixed with a small buffer of earlier rows. This reduces forgetting somewhat but is **not** a complete solution to catastrophic forgetting.
+- **Transfer + fine-tuning:** only possible with a separate source dataset that has the same feature and target columns and a model whose weights can be updated. It is not simply retraining.
+- **Full retrain** is included only as a non-incremental reference.
+""")
+            metric_opts = REG_METRICS if task == "regression" else CLS_METRICS
+            s1, s2, s3, s4, s5 = st.columns(5)
+            metric = s1.selectbox("Ranking metric", metric_opts, key=f"rankm_{fid}")
+            bs = int(s2.number_input("Update batch size", 8, 2048, 64, key=f"sbs_{fid}"))
+            epochs = int(s3.number_input("Epochs per batch", 1, 20, 2, key=f"sep_{fid}"))
+            replay_size = int(s4.number_input("Replay buffer size", 0, 20000, 500, 50, key=f"srs_{fid}"))
+            replay_pb = int(s5.number_input("Replay rows per batch", 1, 2048, 64, key=f"srb_{fid}"))
+            src_file = st.file_uploader("Optional: source-domain CSV for transfer learning (same feature columns and target)", type=["csv"], key=f"src_{fid}")
+            source, source_msg = None, "No source/pretrained dataset was provided, so transfer learning is not possible. Upload a compatible source CSV to enable it."
+            if src_file is not None and perf["bundle"].supports_partial:
+                try:
+                    sx, sy, source_msg = prepare_source(src_file.getvalue(), list(num_cols), list(cat_cols), target, task,
+                                                        perf["classes"], max_train_rows, seed)
+                    source = (sx, sy) if sx is not None else None
+                    (st.success if source else st.warning)(source_msg)
+                except Exception as exc:
+                    source_msg = f"Could not use the source CSV: {exc}"
+                    st.warning(source_msg)
+            opts = dict(metric=metric, batch_size=bs, epochs=epochs, replay_size=replay_size, replay_per_batch=replay_pb,
+                        online_max_rows=3000, seed=seed, max_train_rows=max_train_rows, source_msg=source_msg,
+                        num_cols=num_cols, cat_cols=cat_cols)
+            sig = "|".join(map(str, [sig_base, metric, bs, epochs, replay_size, replay_pb, src_file.name if src_file else None,
+                                     len(src_file.getvalue()) if src_file else 0]))
+            if st.button("Run strategy comparison", type="primary", key=f"runstrat_{fid}"):
+                try:
+                    with st.spinner("Updating and evaluating strategies..."):
+                        res = run_strategies(X_model, y_arr, perf, task, family, opts, source)
+                    res["sig"] = sig
+                    res["x_test"] = x_lab.iloc[te].to_numpy()
+                    st.session_state["strat"] = res
+                except Exception as exc:
+                    st.error(f"Strategy comparison failed: {exc}")
+            res = st.session_state.get("strat")
+            if res is not None and not str(res["sig"]).startswith(str(fid)):
+                res = None
+            if res is not None:
+                if res["sig"] != sig:
+                    st.warning("Settings changed since this result was produced. Click 'Run strategy comparison' to refresh.")
+                st.markdown("**Strategy availability**")
+                st.dataframe(res["availability"], hide_index=True)
+                mdf, mname = res["metrics"], res["metric"]
+                st.markdown(f"**Metrics on the same held-out test set** ({len(res['y_test']):,} rows; ranking metric: {mname}, "
+                            f"{'higher' if HIGHER_BETTER[mname] else 'lower'} is better)")
+                st.dataframe(mdf.round(4), hide_index=True)
+                exports["strategy_metrics.csv"] = mdf
+                exports["strategy_test_predictions.csv"] = pd.DataFrame({"actual": res["y_test"], **{k: v for k, v in res["preds"].items()}})
+                if len(mdf) >= 2:
+                    best = mdf.loc[mdf[mname].idxmax() if HIGHER_BETTER[mname] else mdf[mname].idxmin()]
+                    if best["Strategy"] == "Baseline (no update)":
+                        st.info(f"No update strategy beat the baseline on {mname} on this test set. Updating did not help here, "
+                                "which is plausible if no relevant drift occurred.")
+                    else:
+                        dist = best["Distinguishable from baseline?"]
+                        st.success(f"Best on {mname}: **{best['Strategy']}** ({best[mname]:.4g}); change vs baseline "
+                                   f"{best[IMPROVE_COL]:+.1f}%, 95% CI of the gain {best['Gain vs baseline, 95% CI']}. "
+                                   + ("This difference is distinguishable from sampling noise." if dist == "Yes"
+                                      else "This difference is within sampling noise, so do not read it as a real improvement."))
+                st.caption("One dataset, one split, one seed. Treat rankings as indicative; repeat with other seeds and splits before deciding.")
+                chart_metric = st.radio("Metric to chart", [c for c in mdf.columns if c in HIGHER_BETTER], horizontal=True,
+                                        index=[c for c in mdf.columns if c in HIGHER_BETTER].index(mname), key=f"chm_{fid}")
+                fig = px.bar(mdf, x="Strategy", y=chart_metric, color="Strategy", text_auto=".4g", title=f"{chart_metric} by strategy (held-out test)")
+                fig.update_layout(showlegend=False, xaxis_title="")
+                # Graph omitted to keep the dashboard focused.
+                if chrono:
+                    fig = go.Figure()
+                    w = max(10, len(res["y_test"]) // 25)
+                    for nm, p in res["preds"].items():
+                        e = pd.Series(row_errors(task, res["y_test"], p)).rolling(w, min_periods=3).mean()
+                        fig.add_trace(go.Scatter(x=res["x_test"], y=e, mode="lines", name=nm))
+                    fig.update_layout(title="Rolling error over the test period by strategy", xaxis_title="Time / row",
+                                      yaxis_title="Rolling MAE" if task == "regression" else "Rolling error rate")
+                    # Graph omitted to keep the dashboard focused.
+                pick = st.selectbox("Inspect predictions of", list(res["preds"]), key=f"inspect_{fid}")
+                pp = res["preds"][pick]
+                if task == "regression":
+                    fig = px.scatter(x=res["y_test"], y=pp, opacity=0.6, labels={"x": "Actual", "y": "Predicted"}, title=f"Actual vs predicted: {pick}")
+                    lim = [float(min(res["y_test"].min(), pp.min())), float(max(res["y_test"].max(), pp.max()))]
+                    fig.add_trace(go.Scatter(x=lim, y=lim, mode="lines", name="Perfect", line=dict(dash="dash", color="gray")))
+                else:
+                    labs = sorted(set(res["y_test"]) | set(pp))
+                    fig = px.imshow(confusion_matrix(res["y_test"], pp, labels=labs), x=labs, y=labs, text_auto=True, color_continuous_scale="Blues",
+                                    labels=dict(x="Predicted", y="Actual", color="Count"), title=f"Confusion matrix: {pick}")
+                # Graph omitted to keep the dashboard focused.
+
+# ======================================================= Live Stream Simulation
+with tabs[5]:
+    st.subheader("Live-stream simulation (replay of your static CSV)")
+    st.warning("This replays rows from the uploaded file in chronological batches. It is a simulation, **not** a live data connection. "
+               "Drift never stops the replay; alerts only trigger the action you choose, and the production model is never replaced automatically.")
+    if not chrono or n_rows < 100:
+        st.info("The simulation needs chronological order (choose a time column or declare row order as chronological) and at least 100 rows.")
+    elif not features:
+        st.info("Select at least one feature column to monitor.")
+    else:
+        use_model = perf is not None
+        if use_model:
+            n_tr = len(perf["parts"][0])
+            ref_frame, stream_frame = lf.iloc[:n_tr][list(features)], lf.iloc[n_tr:][list(features)].reset_index(drop=True)
+            st.caption(f"Reference = the model's training partition ({n_tr:,} rows). Stream = the {len(stream_frame):,} later labelled rows.")
+        else:
+            ref_pct = st.slider("Reference window = first (% of rows)", 10, 70, 40, key=f"simref_{fid}")
+            cut = int(n_rows * ref_pct / 100)
+            ref_frame, stream_frame = df_ord.iloc[:cut][list(features)], df_ord.iloc[cut:][list(features)].reset_index(drop=True)
+            st.caption("No target selected: only input-feature drift is monitored. Collect labels to monitor performance.")
+        if len(stream_frame) < 50 or len(ref_frame) < 30:
+            st.warning("Reference or stream is too small for a simulation. Adjust the split or provide more rows.")
+        else:
+            g1, g2, g3, g4 = st.columns(4)
+            def_b = int(max(50, len(stream_frame) // 20))
+            bsz = int(g1.number_input("Batch size (rows)", 10, max(len(stream_frame), 10), min(def_b, len(stream_frame)), key=f"simB_{fid}"))
+            s_lo = float(g2.number_input("Moderate PSI ≥", 0.01, 5.0, 0.10, 0.01, key=f"slo_{fid}"))
+            s_hi = float(g3.number_input("Significant PSI ≥ (raises alert)", 0.02, 10.0, 0.25, 0.01, key=f"shi_{fid}"))
+            n_sbins = int(g4.number_input("Numeric bins", 3, 20, 5, key=f"sbins_{fid}"))
+            if bsz < 100:
+                st.caption("Small batches make PSI noisy; consider batches of 100+ rows.")
+            policy, delay_b, adelta, cooldown, sep = POLICY_MONITOR, 0, 0.002, 3, 2
+            if use_model:
+                h1, h2, h3 = st.columns(3)
+                pols = [POLICY_MONITOR, POLICY_RETRAIN] + ([POLICY_PARTIAL] if perf["bundle"].supports_partial else [])
+                policy = h1.selectbox("Action when an alert fires", pols, key=f"pol_{fid}",
+                                      help="Candidates run in shadow mode; the production baseline is never replaced.")
+                delay_b = int(h2.number_input("Label delay (batches)", 0, 20, 1, key=f"sdel_{fid}"))
+                adelta = float(h3.select_slider("ADWIN δ", [0.0005, 0.001, 0.002, 0.005, 0.01, 0.05], value=0.002, key=f"sad_{fid}"))
+                if not perf["bundle"].supports_partial:
+                    st.caption(f"{FAMILY_NAME[family]} cannot be updated incrementally, so that action is not offered.")
+            ssig = "|".join(map(str, [sig_base if use_model else fid, features, bsz, s_lo, s_hi, n_sbins, policy, delay_b, adelta]))
+            if st.button("Run simulation", type="primary", key=f"runsim_{fid}"):
+                try:
+                    with st.spinner("Replaying the data in batches..."):
+                        spec = build_reference(ref_frame, list(features), kinds, n_sbins)
+                        model = None
+                        if use_model:
+                            tr_fit = perf["tr_fit"]
+                            model = dict(base=perf["bundle"], task=task, Xs=X_model.iloc[n_tr:].reset_index(drop=True), ys=y_arr[n_tr:],
+                                         X_train=X_model.iloc[tr_fit], y_train=y_arr[tr_fit], family=family, num_cols=list(num_cols),
+                                         cat_cols=list(cat_cols), classes=perf["classes"], seed=seed)
+                        sim = run_simulation(stream_frame, spec, s_lo, s_hi, bsz, model, policy, delay_b, adelta, cooldown, sep)
+                        sim["sig"], sim["delay"], sim["thr"] = ssig, delay_b, (s_lo, s_hi)
+                        sim["x"] = (x_lab.iloc[n_tr:] if use_model else xvals.iloc[len(ref_frame):]).reset_index(drop=True)
+                        st.session_state["sim"] = sim
+                except Exception as exc:
+                    st.error(f"Simulation failed: {exc}")
+            sim = st.session_state.get("sim")
+            if sim is not None and not str(sim["sig"]).startswith(str(sig_base if use_model else fid)):
+                sim = None
+            if sim is not None:
+                if sim["sig"] != ssig:
+                    st.warning("Settings changed since this simulation ran. Click 'Run simulation' to refresh.")
+                bdf, adf, vdf, stask = sim["batches"], sim["alerts"], sim["versions"], sim["task"]
+                exports["simulation_batches.csv"] = bdf
+                exports["simulation_alerts.csv"] = adf
+                exports["simulation_model_versions.csv"] = vdf
+                nb = len(bdf)
+                cur = st.slider("Replay position: current batch", 1, nb, nb, key=f"cur_{fid}")
+                row = bdf.iloc[cur - 1]
+                a, b, c, d = st.columns(4)
+                a.metric("Current batch", f"{cur} / {nb}")
+                b.metric("Rows in batch", f"{int(row['Start row']):,}–{int(row['End row']):,}")
+                c.metric("Input drift status", row["Data drift status"])
+                d.metric("Max PSI", f"{row['Max PSI']:.3f}" if not np.isnan(row["Max PSI"]) else "n/a")
+                seen = bdf.iloc[:cur]
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=seen["Batch"], y=seen["Max PSI"], mode="lines+markers", name="Max PSI",
+                                         marker=dict(color=[STATUS_COLORS[s] for s in seen["Data drift status"]], size=9)))
+                fig.add_trace(go.Scatter(x=seen["Batch"], y=seen["Mean PSI"], mode="lines", name="Mean PSI", line=dict(dash="dot")))
+                fig.add_hline(y=sim["thr"][1], line_dash="dash", line_color=STATUS_COLORS["Significant"], annotation_text="alert threshold")
+                fig.update_layout(title="Input drift per batch (PSI vs reference)", xaxis_title="Batch", yaxis_title="PSI")
+                # Graph omitted to keep the dashboard focused.
+                if stask:
+                    pm = "MAE" if stask == "regression" else "Accuracy"
+                    measured = bdf[bdf["Labels available at batch"] <= cur]
+                    if len(measured):
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=measured["Batch"], y=measured[f"Production {pm}"], mode="lines+markers", name="Production (frozen baseline)"))
+                        fig.add_trace(go.Scatter(x=measured["Batch"], y=measured[f"Candidate {pm}"], mode="lines+markers", name="Shadow candidate",
+                                                 line=dict(dash="dash")))
+                        for _, vr in vdf[(vdf["Batch"] > 0) & (vdf["Batch"] <= cur)].iterrows():
+                            fig.add_vline(x=vr["Batch"], line_color="lightgray", line_width=1)
+                        for _, ar in adf[(adf["Batch"] <= cur) & (adf["Type"].str.startswith("Prediction"))].iterrows():
+                            vline(fig, ar["Batch"], "perf alert")
+                        fig.update_layout(title=f"{pm} per batch (shown once labels have arrived; gray lines = candidate updates)",
+                                          xaxis_title="Batch (when predicted)", yaxis_title=pm)
+                        # Graph omitted to keep the dashboard focused.
+                        st.dataframe(measured.iloc[[-1]][["Batch"] + [c for c in measured.columns if c.startswith(("Production", "Candidate"))]].round(4), hide_index=True)
+                    pending = bdf[(bdf["Labels available at batch"] > cur)].shape[0]
+                    if pending:
+                        st.info(f"{pending} most recent batch(es) have predictions but their labels have not arrived yet, so their performance is unknown.")
+                    upd = vdf[(vdf["Batch"] > 0) & (vdf["Batch"] <= cur)]
+                    if len(upd):
+                        first_u = int(upd["Batch"].min())
+                        after = measured[measured["Batch"] > first_u]
+                        if len(after):
+                            pw, cw = after[f"Production {pm}"].mean(), after[f"Candidate {pm}"].mean()
+                            better = (cw < pw) if stask == "regression" else (cw > pw)
+                            st.markdown(f"**Before vs after adaptation** (batches measured after the first candidate update, n={len(after)}): production {pm} {pw:.4g}, "
+                                        f"candidate {cw:.4g}. The candidate was {'better' if better else 'not better'} on average over these batches. "
+                                        "It is a shadow model and has **not** replaced production.")
+                st.markdown("**Alerts so far**")
+                st.dataframe(adf[adf["Batch"] <= cur], hide_index=True)
+                if stask:
+                    st.markdown("**Model version history**")
+                    st.dataframe(vdf[vdf["Batch"] <= cur], hide_index=True)
+                recs = []
+                if (adf[adf["Batch"] <= cur]["Type"] == "Input (feature) drift").any():
+                    recs.append("Input drift was flagged: inspect the drifting features, check for upstream data changes, and keep monitoring. This alone does not show the model got worse.")
+                if stask and (adf[adf["Batch"] <= cur]["Type"].str.startswith("Prediction")).any():
+                    recs.append("Prediction errors changed: verify labels, then consider retraining or updating a compatible model, and validate any candidate on recent labelled data before replacing production.")
+                if stask and sim["delay"] > 0:
+                    recs.append(f"Labels arrive {sim['delay']} batch(es) late: performance for the newest batches is unknown. Prioritise collecting labels.")
+                if not stask:
+                    recs.append("No target is selected: collect labels to measure performance and detect concept drift.")
+                st.markdown("**Recommended next steps at this point in the replay**")
+                for r_ in recs or ["No alerts so far: continue monitoring."]:
+                    st.markdown(f"- {r_}")
+
+# ======================================================= Results and Downloads
+with tabs[6]:
+    st.subheader("Results and downloads")
+    st.markdown("Everything below is generated from **your** uploaded file and the settings you chose. Items appear after the relevant analysis has run.")
+    if not exports:
+        st.info("No results yet.")
+    for name, frame in exports.items():
+        st.download_button(f"Download {name}", csv_bytes(frame), name, "text/csv", key=f"dl_{name}")
+    st.subheader("Limitations to keep in mind")
+    st.markdown("""
+- Without real target labels, model performance and concept drift **cannot** be measured; only input drift (PSI) is available.
+- Incremental, online and continual strategies need an estimator with `partial_fit`; random forests are limited to retraining.
+- Transfer learning needs a separate source dataset with matching features and target; it is unavailable otherwise.
+- PSI thresholds are rules of thumb; small windows inflate PSI. The ADWIN-style detector is a simplified version and needs many labelled rows.
+- One split and seed give one noisy comparison; results are indicative, not a universal ranking of methods.
+- Replaying a CSV is a simulation. Nothing is deployed or replaced automatically.
+""")
