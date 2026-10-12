@@ -245,7 +245,7 @@ def init_session(df, target, tcol, task, cfg):
               adwin=float(cfg["adwin"]), win_thr=int(cfg["win_thr"]))
     S = dict(X=X, y=y, task=task, num=num, cat=cat, hp=hp, seed=int(cfg["seed"]), n_tr=n_tr, B=B,
              N=len(y) - n_tr, nb=int(np.ceil((len(y) - n_tr) / B)), z=cfg["z"], delay=int(cfg["delay"]),
-             min_rows=int(cfg["min_rows"]), snooze=int(cfg["snooze"]), hold_frac=float(cfg["hold_frac"]),
+             min_rows=int(cfg["min_rows"]), snooze=int(cfg["snooze"]), auto=bool(cfg.get("auto", True)), hold_frac=float(cfg["hold_frac"]),
              metric=cfg.get("metric") or METRICS[task][0], pos=pos,
              version=0, k=0, errs=[], thr=[], ver=[], bad=[], good=0, alert=None, snooze_until=0,
              cand=None, events=[], retrains=[], flash=None)
@@ -452,7 +452,8 @@ def compute_cands(S):
         why = f"The updated model could not be evaluated. Held-out {metric} of the current model: {k_s:.4f}."
     return dict(table=t, errs=errs, preds=preds, yh=yh, notes=notes, hold=hold, n_old=len(yo), n_new=n,
                 n_train=len(yt), failed=failed, metric=metric, warnings=warns, rec=rec, why=why,
-                verdict=verdict, k_s=k_s, r_s=r_s)
+                verdict=verdict, k_s=k_s, r_s=r_s,
+                clear_win=verdict.startswith("Updated model is clearly better"))
 
 
 def apply_choice(S, name):
@@ -658,6 +659,9 @@ def sidebar_config(S):
                                        help="After a drift alert, monitoring continues until this many post-drift "
                                             "labelled rows exist."))
         snooze = int(st.number_input("Snooze after 'keep' (batches)", 0, 200, 10))
+        auto = st.checkbox("Auto-update when clearly better", value=True,
+                           help="If the test shows the updated model is clearly better, it is deployed "
+                                "automatically. Otherwise you are asked.")
         with st.expander("Advanced settings"):
             hold_frac = st.slider("Share of new labelled rows held out for evaluation", 0.10, 0.40, 0.25, 0.05)
             metric = st.selectbox("Evaluation metric (lower is better)", METRICS[task])
@@ -692,7 +696,7 @@ def sidebar_config(S):
             go_ = True
         if go_:
             cfg = dict(train_pct=train_pct, B=B, z=SENS[sens], delay=delay, min_rows=min_rows, snooze=snooze,
-                       hold_frac=hold_frac, metric=metric, pos=pos, seed=seed,
+                       hold_frac=hold_frac, metric=metric, pos=pos, seed=seed, auto=auto,
                        grace=grace, delta=delta, tau=float(tau), adwin=adwin, win_thr=win_thr)
             try:
                 with st.spinner("Training the first Hoeffding Adaptive Tree..."):
@@ -767,6 +771,11 @@ def main():
                     S["cand"] = compute_cands(S)
                 except Exception as exc:
                     S["cand"] = dict(error=f"Could not evaluate the update: {exc}")
+        c = S["cand"]
+        if S.get("auto") and c.get("clear_win"):
+            ok, msg = apply_choice(S, INC)
+            S["flash"] = ("success" if ok else "error", "Auto-updated: " + msg if ok else msg)
+            st.rerun()
         decision_panel(S)
 
     if S["retrains"]:
