@@ -340,8 +340,7 @@ class Strategy:
 
 
 def plan_inc(S, Xo, yo, Xn, yn):
-    return Plan("continue", Xn, yn, note=f"copy of the deployed tree keeps learning from {len(yn):,} new rows; its "
-                                         "ADWIN detectors can replace outdated branches")
+    return Plan("continue", Xn, yn, note=f"the model learns from the {len(yn):,} new rows")
 
 
 def plan_keep(S, Xo, yo, Xn, yn):
@@ -349,9 +348,9 @@ def plan_keep(S, Xo, yo, Xn, yn):
 
 
 STRATEGIES = [
-    Strategy(INC, plan_inc, "Keep learning on a copy of the deployed tree using only the new rows, one row at a "
-                            "time. The tree's own drift detectors swap out branches that stopped working."),
-    Strategy(KEEP, plan_keep, "Leave the deployed model untouched."),
+    Strategy(INC, plan_inc, "The model keeps what it already knows and learns from the recent data. "
+                            "Parts that no longer work are replaced automatically."),
+    Strategy(KEEP, plan_keep, "No changes. The model stays as it is."),
 ]
 REG = {s.name: s for s in STRATEGIES}
 
@@ -578,9 +577,9 @@ def decision_panel(S):
                       delta_color="inverse", help=f"Held-out {c['metric']}, lower is better")
         else:
             v2.metric("After continue learning", "n/a")
-        st.caption(f"{REG[INC].blurb}  \nHow it will be built: {c['notes'].get(INC, 'n/a')}. The model that gets "
-                   "deployed learns from all new rows, including the held-out ones, so it differs slightly from "
-                   "the one measured above.")
+        st.markdown(f"**What \"continue learning\" does:** {REG[INC].blurb}")
+        st.caption(f"The scores above come from a test on {c['hold']:,} recent rows kept aside. "
+                   "The final model learns from all new rows, so results may differ slightly.")
 
         k = S["k"]
         a1, a2, _ = st.columns([1.6, 1.6, 3])
