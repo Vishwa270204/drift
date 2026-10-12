@@ -25,7 +25,11 @@ SENS = {"Low (fewer alerts)": 4.0, "Medium": 3.0, "High (more alerts)": 2.0}
 KEEP = "Keep current model (no retrain)"
 NEWO, BOTH = "New data only", "Old + new data"
 WGT, WIN = "Old + new, new weighted 3x", "Recent window only"
-FT = "Fine-tune current model on new data"
+INC = "Incremental (mini-batch partial_fit on new data)"
+ONL = "Online (one row at a time)"
+CONT = "Continual (new data + replay of old data)"
+TRF = "Transfer (pretrain on source CSV, fine-tune on new)"
+MB = 64   # mini-batch size for incremental / continual updates
 
 
 # ------------------------------------------------------------------ models
@@ -85,6 +89,23 @@ class Bundle:
             keep = np.isin(y, self.classes)
             X, y = X[keep], y[keep]
         self._partial(np.asarray(self.pre.transform(X), float), y, epochs)
+        return self
+
+    def update_batches(self, X, y, bs, epochs, replay=None, rng=None):
+        """Sequential partial_fit in mini-batches; optionally mix each batch with replayed old rows."""
+        y = np.asarray(y)
+        if self.task == "classification":
+            keep = np.isin(y, self.classes)
+            X, y = X[keep], y[keep]
+        Xt = np.asarray(self.pre.transform(X), float)
+        if replay is not None:
+            Rt, ry = np.asarray(self.pre.transform(replay[0]), float), np.asarray(replay[1])
+        for s in range(0, len(y), bs):
+            xb, yb = Xt[s:s + bs], y[s:s + bs]
+            if replay is not None and len(ry):
+                pick = rng.choice(len(ry), min(MB, len(ry)), replace=False)
+                xb, yb = np.vstack([xb, Rt[pick]]), np.concatenate([yb, ry[pick]])
+            self._partial(xb, yb, epochs)
         return self
 
     def predict(self, X):
@@ -211,7 +232,16 @@ def build(S, name, Xo, yo, Xn, yn):
     if name == WIN:
         w = min(len(ya), max(2 * len(yn), 200))
         return fit_new(S, Xa.iloc[-w:], ya[-w:])
-    return copy.deepcopy(S["model"]).fine_tune(Xn, yn)
+    rng = np.random.default_rng(S["seed"])
+    if name == TRF:
+        return fit_new(S, *S["source"]).update_batches(Xn, yn, MB, 3)
+    m = copy.deepcopy(S["model"])
+    if name == INC:
+        return m.update_batches(Xn, yn, MB, 2)
+    if name == ONL:
+        return m.update_batches(Xn.iloc[-1500:], yn[-1500:], 1, 1)
+    sel = rng.choice(len(yo), min(500, len(yo)), replace=False)          # CONT: replay buffer of old rows
+    return m.update_batches(Xn, yn, MB, 2, replay=(Xo.iloc[sel], yo[sel]), rng=rng)
 
 
 def compute_cands(S):
@@ -219,23 +249,34 @@ def compute_cands(S):
     Xo, yo, Xn, yn = get_data(S, True)
     hold = min(int(max(50, 0.25 * len(yn))), len(yn) - 30)
     Xh, yh, Xt, yt = Xn.iloc[-hold:], yn[-hold:], Xn.iloc[:-hold], yn[:-hold]
-    names = [KEEP, NEWO, BOTH, WGT, WIN] + ([FT] if hasattr(S["model"].est, "partial_fit") else [])
+    can = hasattr(S["model"].est, "partial_fit")
+    no_pf = "random forest has no partial_fit"
+    names, skipped = [KEEP, NEWO, BOTH, WGT, WIN], []
+    if can:
+        names += [INC, ONL, CONT]
+    else:
+        skipped += [(n, no_pf) for n in (INC, ONL, CONT)]
+    if can and S["source"] is not None:
+        names.append(TRF)
+    else:
+        skipped.append((TRF, no_pf if not can else S["src_msg"]))
     rows, errs = [], {}
     for n in names:
         try:
             e = row_err(S["task"], yh, build(S, n, Xo, yo, Xt, yt).predict(Xh))
             errs[n] = e
             rows.append({"Strategy": n, "Holdout error": float(e.mean())})
-        except Exception:
-            continue
+        except Exception as exc:
+            skipped.append((n, str(exc)))
     t = pd.DataFrame(rows)
     keep = t.loc[t["Strategy"] == KEEP, "Holdout error"].iloc[0]
     t["Better than keeping (%)"] = (keep - t["Holdout error"]) / max(keep, 1e-12) * 100
-    return dict(table=t, errs=errs, hold=hold, n_old=len(yo), n_new=len(yn))
+    return dict(table=t, errs=errs, hold=hold, n_old=len(yo), n_new=len(yn), skipped=skipped)
 
 
 def apply_choice(S, name):
     al, c = S["alert"], S["cand"]
+    S["comps"].append(c["table"].assign(Decision=len(S["comps"]) + 1))
     if name == KEEP:
         S["snooze_until"] = S["k"] + S["snooze"]
         log(S, "Kept current model", f"no alerts for {S['snooze']} batches")
@@ -274,6 +315,8 @@ with st.expander("Settings"):
     min_rows = int(s5.number_input("Min new labelled rows before asking", 100, 100000, 300,
                                    help="After a drift alert, the app waits (and keeps monitoring) until this many post-drift labelled rows exist."))
     snooze = int(s6.number_input("Snooze after 'keep' (batches)", 0, 200, 10))
+    src_file = st.file_uploader("Optional: source-domain CSV for transfer learning (same feature columns and target)",
+                                type=["csv"], key="src")
 
 if st.button("Start monitoring", type="primary"):
     d = df.copy()
@@ -289,11 +332,33 @@ if st.button("Start monitoring", type="primary"):
     y = d[target].astype(float).to_numpy() if task == "regression" else d[target].astype(str).to_numpy()
     n_tr = int(len(d) * train_pct / 100)
     n_fit = int(n_tr * 0.8)
+    source, src_msg = None, "no source CSV was uploaded"
+    if src_file is not None:
+        try:
+            sd = read(src_file.getvalue())
+            miss = [c for c in num + cat + [target] if c not in sd.columns]
+            if miss:
+                src_msg = f"source CSV is missing columns {miss}"
+            else:
+                sx = build_frame(sd, num, cat)
+                if task == "regression":
+                    sy = pd.to_numeric(sd[target], errors="coerce").to_numpy(float)
+                    ok = ~np.isnan(sy)
+                else:
+                    sy = sd[target].astype(str).to_numpy()
+                    ok = np.isin(sy, np.unique(y))
+                sx, sy = sx[ok].reset_index(drop=True), sy[ok]
+                if len(sy) < 50:
+                    src_msg = f"only {len(sy)} usable source rows (need 50)"
+                else:
+                    source, src_msg = (sx, sy), f"{len(sy):,} source rows"
+        except Exception as exc:
+            src_msg = f"could not use the source CSV: {exc}"
     S = dict(X=X, y=y, task=task, family=family, num=num, cat=cat, seed=42, n_tr=n_tr, B=B, N=len(y) - n_tr,
              nb=int(np.ceil((len(y) - n_tr) / B)), z=SENS[sens], delay=delay, min_rows=min_rows, snooze=snooze,
              classes=np.unique(y) if task == "classification" else None,
              version=0, k=0, errs=[], thr=[], ver=[], bad=[], good=0, alert=None, snooze_until=0,
-             cand=None, events=[], retrains=[])
+             cand=None, events=[], retrains=[], comps=[], source=source, src_msg=src_msg)
     try:
         S["model"] = Bundle(family, task, num, cat, S["classes"], 42).fit(X.iloc[:n_fit], y[:n_fit])
     except Exception as exc:
@@ -377,6 +442,8 @@ if ready(S):
         x=t["Holdout error"], y=t["Strategy"], orientation="h", text=t["Holdout error"].round(4),
         marker_color=["#888" if s == KEEP else "#2e9e5b" for s in t["Strategy"]])).update_layout(
         title="Error on the newest labelled rows (lower is better)", yaxis=dict(autorange="reversed"), height=300))
+    if c["skipped"]:
+        st.caption("Not available here: " + "; ".join(f"{n} ({why})" for n, why in c["skipped"]))
     choice = st.radio("Apply", list(t["Strategy"]), index=0, key=f"choice_{S['k']}",
                       help="Preselected = lowest error. Pick another option if you prefer.")
     a1, a2 = st.columns([1, 3])
@@ -406,3 +473,20 @@ if S["retrains"]:
 if S["events"]:
     with st.expander("Event log"):
         st.dataframe(pd.DataFrame(S["events"]), hide_index=True)
+
+if S["comps"]:
+    st.subheader("Which strategy is best overall?")
+    allc = pd.concat(S["comps"])
+    lb = (allc.groupby("Strategy").agg(avg_gain=("Better than keeping (%)", "mean"), n=("Decision", "count"))
+          .reset_index().sort_values("avg_gain", ascending=False))
+    st.plotly_chart(go.Figure(go.Bar(
+        x=lb["avg_gain"], y=lb["Strategy"], orientation="h", text=lb["avg_gain"].round(1),
+        marker_color=["#888" if n == KEEP else "#2e9e5b" for n in lb["Strategy"]])).update_layout(
+        title="Average error reduction vs keeping the current model (%, higher is better)",
+        yaxis=dict(autorange="reversed"), height=320))
+    top = lb[lb["Strategy"] != KEEP].iloc[0] if (lb["Strategy"] != KEEP).any() else None
+    if top is not None and top["avg_gain"] > 0:
+        st.success(f"Best so far: **{top['Strategy']}**, averaging {top['avg_gain']:+.1f}% vs keeping the model "
+                   f"across {int(top['n'])} drift decision(s). More drift events make this ranking more reliable.")
+    else:
+        st.info("No retraining strategy has beaten keeping the current model yet.")
