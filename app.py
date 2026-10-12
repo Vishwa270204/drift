@@ -1,9 +1,15 @@
-"""Model Drift Dashboard (refactored).
+"""Model Drift Dashboard (Hoeffding tree edition).
 
-Streams a labelled CSV through a deployed model, detects drift from per-batch error, and when drift is
-confirmed lets the user pick ONE adaptation strategy. Strategy selection is separated from training:
+Streams a labelled CSV through ONE deployed model, a Hoeffding tree from `river` (pip install river), detects drift
+from per-batch error, and when drift is confirmed lets the user pick ONE adaptation strategy. Strategy selection is
+separated from training:
 
     Strategy (registry)  ->  plan function (data selection)  ->  execute() (training procedure)
+
+A Hoeffding tree learns one row at a time and cannot forget what it has already learned. So the strategies fall into
+two groups:
+    * rebuild   : grow a fresh tree on a chosen slice of data (the only way to truly drop the old concept)
+    * continue  : keep learning on a copy of the deployed tree (fast, but old splits stay)
 
 All candidates are trained WITHOUT the newest labelled rows and scored on those same held-out rows.
 The deployed model only changes after Apply succeeds.
@@ -18,31 +24,28 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.exceptions import ConvergenceWarning
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import SGDClassifier, SGDRegressor
 from sklearn.metrics import confusion_matrix, f1_score, precision_recall_fscore_support
-from sklearn.neural_network import MLPClassifier, MLPRegressor
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-warnings.filterwarnings("ignore", category=ConvergenceWarning)
-warnings.filterwarnings("ignore", message="Got `batch_size`")
+try:
+    from river import tree as river_tree
+    RIVER_OK = True
+except ImportError:                                   # reported in main()
+    river_tree, RIVER_OK = None, False
+
+warnings.filterwarnings("ignore", category=UserWarning, module="river")
 
 # ------------------------------------------------------------------ constants
-FAMILIES = {"SGD (linear)": "sgd", "MLP (neural net)": "mlp", "Random forest": "rf"}
 SENS = {"Low (fewer alerts)": 4.0, "Medium": 3.0, "High (more alerts)": 2.0}
-MB = 64            # mini-batch size for incremental / continual updates
-MIN_FIT = 30       # minimum usable labelled rows to train any model
-ONLINE_TAIL = 1500  # rows used by the online (row-by-row) update
+MB = 64            # replay block size: old rows mixed in after every MB new rows
+MIN_FIT = 30       # minimum usable labelled rows to train a tree
+FIT_CAP = 20000    # max rows used by a single rebuild (keeps the candidate comparison fast)
+NEW_WEIGHT = 3.0   # sample weight of new rows in the weighted strategy
+DELTAS = [1e-3, 1e-5, 1e-7, 1e-9]
 
 RECENT, NEWO, BOTH, CONT, KEEP = ("Recent Window Only", "New Data Only", "Old + New Data",
                                   "Continual Learning", "Keep Current Model")
 WGT = "Weighted Old + New (new data 3x)"
-INC = "Incremental Update (new data)"
-ONL = "Online Update (row by row)"
+INC = "Continue Learning (new data only)"
 TRF = "Transfer Learning (source CSV)"
 
 METRICS = {
@@ -53,39 +56,36 @@ ROW_WISE = {"Error rate", "MAE"}   # metrics with a per-row loss (paired noise c
 PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
 
 
-# ------------------------------------------------------------------ models
-def supports_partial(family):
-    return family in ("sgd", "mlp")
-
-
-def make_est(family, task, seed):
-    reg = task == "regression"
-    if family == "sgd":
-        kw = dict(alpha=1e-4, learning_rate="constant", eta0=0.01, max_iter=50, tol=1e-3, random_state=seed)
-        return SGDRegressor(**kw) if reg else SGDClassifier(loss="log_loss", **kw)
-    if family == "mlp":
-        kw = dict(hidden_layer_sizes=(64, 32), learning_rate_init=0.003, max_iter=100, random_state=seed)
-        return MLPRegressor(**kw) if reg else MLPClassifier(**kw)
-    kw = dict(n_estimators=100, min_samples_leaf=2, random_state=seed, n_jobs=1)
-    return RandomForestRegressor(**kw) if reg else RandomForestClassifier(**kw)
+# ------------------------------------------------------------------ model
+def make_tree(task, cat, hp):
+    kw = dict(grace_period=int(hp["grace"]), delta=float(hp["delta"]), tau=float(hp["tau"]),
+              nominal_attributes=list(cat) or None)
+    return river_tree.HoeffdingTreeRegressor(**kw) if task == "regression" else river_tree.HoeffdingTreeClassifier(**kw)
 
 
 class Bundle:
-    """Preprocessing + estimator (+ regression target scaling). Full fits use est.fit(); incremental
-    updates reuse the already-fitted preprocessing, class list and target scaling of the same bundle."""
+    """A Hoeffding tree plus the small amount of preprocessing it needs (median imputation for numeric columns;
+    categorical columns are passed as nominal attributes). Trees need no scaling or one-hot encoding."""
 
-    def __init__(self, family, task, num, cat, seed):
-        self.family, self.task, self.num, self.cat, self.seed = family, task, num, cat, seed
-        self.classes, self.mu, self.sd = None, 0.0, 1.0
+    def __init__(self, task, num, cat, hp, seed):
+        self.task, self.num, self.cat, self.hp, self.seed = task, list(num), list(cat), hp, seed
+        self.cols = self.num + self.cat
+        self.med, self.major, self.tree = {}, None, None
 
-    def _target(self, y):
-        y = np.asarray(y)
-        return (y.astype(float) - self.mu) / self.sd if self.task == "regression" else y
+    def _rows(self, X):
+        Z = X[self.cols]
+        if self.num:
+            Z = Z.copy()
+            Z[self.num] = Z[self.num].fillna(self.med)
+        return Z.to_dict("records")
 
-    def _transform(self, X):
-        return np.asarray(self.pre.transform(X), float)
+    def _learn(self, rows, ys, ws=None):
+        reg = self.task == "regression"
+        for i, (x, t) in enumerate(zip(rows, ys)):
+            self.tree.learn_one(x, float(t) if reg else str(t), w=1.0 if ws is None else float(ws[i]))
 
-    def fit(self, X, y):
+    def fit(self, X, y, w=None):
+        """Brand-new tree trained in one pass, in the given (time) order."""
         y = np.asarray(y)
         if len(y) != len(X):
             raise ValueError("features and target have different lengths")
@@ -94,68 +94,38 @@ class Bundle:
         if self.task == "regression":
             if not np.all(np.isfinite(y.astype(float))):
                 raise ValueError("target contains non-finite values")
-            self.mu, self.sd = float(y.mean()), float(y.std()) or 1.0
         else:
-            self.classes = np.unique(y)
-            if len(self.classes) < 2 and self.family != "rf":
-                raise ValueError("only one class in this training data")
-        steps = []
-        if self.num:
-            steps.append(("n", Pipeline([("i", SimpleImputer(strategy="median", keep_empty_features=True)),
-                                         ("s", StandardScaler())]), self.num))
-        if self.cat:
-            steps.append(("c", OneHotEncoder(handle_unknown="ignore", sparse_output=False), self.cat))
-        self.pre = ColumnTransformer(steps).fit(X)          # fitted on this model's training rows only
-        self.est = make_est(self.family, self.task, self.seed)
-        self.est.fit(self._transform(X), self._target(y))
-        if not self.healthy():
-            raise ValueError("training produced non-finite parameters")
+            self.major = str(pd.Series(y).mode().iloc[0])
+        self.med = {c: (float(X[c].median()) if X[c].notna().any() else 0.0) for c in self.num}
+        self.tree = make_tree(self.task, self.cat, self.hp)
+        self._learn(self._rows(X), y, w)
         return self
 
-    def healthy(self):
-        if self.family == "sgd":
-            arrs = [self.est.coef_, self.est.intercept_]
-        elif self.family == "mlp":
-            arrs = list(self.est.coefs_) + list(self.est.intercepts_)
-        else:
-            return True
-        return all(np.all(np.isfinite(a)) for a in arrs)
-
-    def update_batches(self, X, y, bs, epochs, replay=None, rng=None):
-        """Sequential partial_fit in mini-batches (SGD / MLP only). Keeps the fitted preprocessing, class list
-        and regression target scaling. Optionally mixes a random replay batch of old rows into every step."""
-        if not supports_partial(self.family):
-            raise ValueError("this model has no partial_fit")
+    def learn(self, X, y, replay=None, rng=None):
+        """Keep learning on the existing tree (and its medians). Optionally mixes a random replay sample of old rows
+        in after every MB new rows."""
         y = np.asarray(y)
         if len(y) == 0:
-            raise ValueError("no labelled rows to update with")
-        ry = None
-        if replay is not None and len(replay[1]):
-            ry = np.asarray(replay[1])
-        if self.task == "classification":
-            seen = y if ry is None else np.concatenate([y, ry])
-            unseen = np.setdiff1d(np.unique(seen), self.classes)
-            if len(unseen):
-                raise ValueError(f"labels {list(unseen)[:5]} were not seen when this model was trained")
+            raise ValueError("no labelled rows to learn from")
+        rows = self._rows(X)
+        if replay is None or len(replay[1]) == 0:
+            self._learn(rows, y)
+            return self
         rng = rng or np.random.default_rng(self.seed)
-        Xt, yt = self._transform(X), self._target(y)
-        if ry is not None:
-            Rt, ryt = self._transform(replay[0]), self._target(ry)
-        for s in range(0, len(yt), bs):
-            xb, yb = Xt[s:s + bs], yt[s:s + bs]
-            if ry is not None:
-                pick = rng.choice(len(ryt), min(MB, len(ryt)), replace=False)
-                xb, yb = np.vstack([xb, Rt[pick]]), np.concatenate([yb, ryt[pick]])
-            for _ in range(epochs):
-                p = rng.permutation(len(yb))
-                self.est.partial_fit(xb[p], yb[p])
-        if not self.healthy():
-            raise ValueError("incremental update diverged (non-finite parameters)")
+        rrows, ry = self._rows(replay[0]), np.asarray(replay[1])
+        for s in range(0, len(y), MB):
+            pick = rng.choice(len(ry), min(MB, len(ry)), replace=False)
+            self._learn([rrows[i] for i in pick], ry[pick])
+            self._learn(rows[s:s + MB], y[s:s + MB])
         return self
 
     def predict(self, X):
-        p = self.est.predict(self._transform(X))
-        return p * self.sd + self.mu if self.task == "regression" else np.asarray(p).astype(str)
+        reg = self.task == "regression"
+        out = []
+        for x in self._rows(X):
+            p = self.tree.predict_one(x)
+            out.append((0.0 if p is None else float(p)) if reg else (self.major if p is None else str(p)))
+        return np.asarray(out, float) if reg else np.asarray(out).astype(str)
 
 
 def row_err(task, y, p):
@@ -170,15 +140,17 @@ def ref_stats(task, e):
     return m, max(s, 0.1 * m, 1e-9)
 
 
-def fit_new(S, X, y, cap=30000):
-    """Fresh model: preprocessing, classes and target scaling are fitted on exactly (X, y)."""
+def fit_new(S, X, y, w=None, cap=FIT_CAP):
+    """Fresh tree: imputation values are computed from exactly (X, y)."""
     if len(y) == 0:
         raise ValueError("no training rows selected")
     X = X.reset_index(drop=True)
+    y = np.asarray(y)
     if len(y) > cap:
         pick = np.sort(np.random.default_rng(S["seed"]).choice(len(y), cap, replace=False))
-        X, y = X.iloc[pick], np.asarray(y)[pick]
-    return Bundle(S["family"], S["task"], S["num"], S["cat"], S["seed"]).fit(X, y)
+        X, y = X.iloc[pick], y[pick]
+        w = None if w is None else np.asarray(w)[pick]
+    return Bundle(S["task"], S["num"], S["cat"], S["hp"], S["seed"]).fit(X, y, w)
 
 
 # ------------------------------------------------------------------ metrics
@@ -287,8 +259,10 @@ def prepare_source(sd, num, cat, target, task, classes):
 
 
 # ------------------------------------------------------------------ session setup (UI independent)
-def init_session(df, target, tcol, family, task, cfg, src_df=None):
+def init_session(df, target, tcol, task, cfg, src_df=None):
     """Build the monitoring session dict. Raises ValueError with a readable message on bad input."""
+    if not RIVER_OK:
+        raise ValueError("The `river` package is not installed (pip install river).")
     d = df.copy()
     if tcol not in (None, "(row order)"):
         tv = pd.to_numeric(d[tcol], errors="coerce") if pd.api.types.is_numeric_dtype(d[tcol]) \
@@ -325,7 +299,8 @@ def init_session(df, target, tcol, family, task, cfg, src_df=None):
             source, src_msg = prepare_source(src_df, num, cat, target, task, classes0)
         except Exception as exc:
             source, src_msg = None, f"could not use the source CSV: {exc}"
-    S = dict(X=X, y=y, task=task, family=family, num=num, cat=cat, seed=int(cfg.get("seed", 42)), n_tr=n_tr, B=B,
+    hp = dict(grace=int(cfg.get("grace", 200)), delta=float(cfg.get("delta", 1e-7)), tau=float(cfg.get("tau", 0.05)))
+    S = dict(X=X, y=y, task=task, num=num, cat=cat, hp=hp, seed=int(cfg.get("seed", 42)), n_tr=n_tr, B=B,
              N=len(y) - n_tr, nb=int(np.ceil((len(y) - n_tr) / B)), z=cfg["z"], delay=int(cfg["delay"]),
              min_rows=int(cfg["min_rows"]), snooze=int(cfg["snooze"]), window=int(cfg["window"]),
              replay=int(cfg["replay"]), hold_frac=float(cfg["hold_frac"]),
@@ -333,7 +308,7 @@ def init_session(df, target, tcol, family, task, cfg, src_df=None):
              version=0, k=0, errs=[], thr=[], ver=[], bad=[], good=0, alert=None, snooze_until=0,
              cand=None, events=[], retrains=[], comps=[], source=source, src_msg=src_msg, flash=None)
     try:
-        S["model"] = Bundle(family, task, num, cat, S["seed"]).fit(X.iloc[:n_fit], y[:n_fit])
+        S["model"] = Bundle(task, num, cat, hp, S["seed"]).fit(X.iloc[:n_fit], y[:n_fit])
     except Exception as exc:
         raise ValueError(f"Could not train the first model: {exc}")
     e = row_err(task, y[n_fit:n_tr], S["model"].predict(X.iloc[n_fit:n_tr]))
@@ -409,12 +384,11 @@ def get_data(S):
 # ------------------------------------------------------------------ strategies: data selection -> training
 @dataclass
 class Plan:
-    kind: str                       # keep | fresh | incremental | transfer
+    kind: str                       # keep | fresh | continue | transfer
     X: Optional[pd.DataFrame] = None
     y: Optional[np.ndarray] = None
+    w: Optional[np.ndarray] = None  # per-row sample weights (fresh only)
     replay: Optional[tuple] = None
-    bs: int = MB
-    epochs: int = 2
     note: str = ""
 
 
@@ -424,7 +398,6 @@ class Strategy:
     tier: str                       # primary | advanced
     plan: Callable
     blurb: str
-    needs_partial: bool = False
     needs_source: bool = False
 
 
@@ -448,50 +421,39 @@ def replay_sample(y, n, rng, task):
 def plan_recent(S, Xo, yo, Xn, yn):
     Xa, ya = _stack(Xo, Xn), np.concatenate([yo, yn])
     w = min(len(ya), S["window"])
-    return Plan("fresh", Xa.iloc[-w:], ya[-w:], note=f"most recent {w:,} labelled rows (old and new), model rebuilt")
+    return Plan("fresh", Xa.iloc[-w:], ya[-w:], note=f"new tree grown on the most recent {w:,} labelled rows")
 
 
 def plan_new(S, Xo, yo, Xn, yn):
-    return Plan("fresh", Xn, yn, note=f"{len(yn):,} post-drift rows only, model rebuilt")
+    return Plan("fresh", Xn, yn, note=f"new tree grown on {len(yn):,} post-drift rows only")
 
 
 def plan_both(S, Xo, yo, Xn, yn):
     return Plan("fresh", _stack(Xo, Xn), np.concatenate([yo, yn]),
-                note=f"all {len(yo):,} old + {len(yn):,} new rows, model rebuilt")
+                note=f"new tree grown on all {len(yo):,} old + {len(yn):,} new rows")
 
 
 def plan_cont(S, Xo, yo, Xn, yn):
     rng = np.random.default_rng(S["seed"])
     idx = replay_sample(yo, S["replay"], rng, S["task"])
     rX, ry = Xo.iloc[idx], yo[idx]
-    if supports_partial(S["family"]):
-        compatible = S["task"] == "regression" or len(np.setdiff1d(np.unique(np.concatenate([yn, ry])),
-                                                                     S["model"].classes)) == 0
-        if compatible:
-            return Plan("incremental", Xn, yn, replay=(rX, ry), bs=MB, epochs=2,
-                        note=f"incremental update of a copy of the deployed model: {len(yn):,} new rows, each "
-                             f"mini-batch mixed with replayed old rows (pool of {len(ry):,})")
-    why = "no partial_fit" if not supports_partial(S["family"]) else "new labels the deployed model has not seen"
-    return Plan("fresh", _stack(rX, Xn), np.concatenate([ry, yn]),
-                note=f"{len(yn):,} new rows + replay of {len(ry):,} old rows, model rebuilt ({why})")
+    return Plan("continue", Xn, yn, replay=(rX, ry),
+                note=f"copy of the deployed tree keeps learning from {len(yn):,} new rows; after every {MB} new rows "
+                     f"it also sees {MB} random old rows (replay pool of {len(ry):,})")
 
 
 def plan_wgt(S, Xo, yo, Xn, yn):
-    return Plan("fresh", pd.concat([Xo] + [Xn] * 3).reset_index(drop=True), np.concatenate([yo] + [yn] * 3),
-                note="old rows + new rows repeated 3x, model rebuilt")
+    w = np.concatenate([np.ones(len(yo)), np.full(len(yn), NEW_WEIGHT)])
+    return Plan("fresh", _stack(Xo, Xn), np.concatenate([yo, yn]), w=w,
+                note=f"new tree grown on old rows (weight 1) + new rows (weight {NEW_WEIGHT:g})")
 
 
 def plan_inc(S, Xo, yo, Xn, yn):
-    return Plan("incremental", Xn, yn, bs=MB, epochs=2, note=f"mini-batch partial_fit on {len(yn):,} new rows")
-
-
-def plan_onl(S, Xo, yo, Xn, yn):
-    t = min(ONLINE_TAIL, len(yn))
-    return Plan("incremental", Xn.iloc[-t:], yn[-t:], bs=1, epochs=1, note=f"one row at a time, last {t:,} new rows")
+    return Plan("continue", Xn, yn, note=f"copy of the deployed tree keeps learning from {len(yn):,} new rows")
 
 
 def plan_trf(S, Xo, yo, Xn, yn):
-    return Plan("transfer", Xn, yn, note="pretrained on source CSV, fine-tuned on new rows")
+    return Plan("transfer", Xn, yn, note="new tree grown on the source CSV, then continues on the new rows")
 
 
 def plan_keep(S, Xo, yo, Xn, yn):
@@ -499,17 +461,18 @@ def plan_keep(S, Xo, yo, Xn, yn):
 
 
 STRATEGIES = [
-    Strategy(RECENT, "primary", plan_recent, "Rebuild from the most recent labelled rows (window size in Advanced settings)."),
-    Strategy(NEWO, "primary", plan_new, "Rebuild using only labelled rows collected since the drift started."),
-    Strategy(BOTH, "primary", plan_both, "Rebuild using all historical rows plus the new rows."),
-    Strategy(CONT, "primary", plan_cont, "New rows plus a replay sample of old rows. Incremental for SGD/MLP, "
-                                         "replay retraining for Random forest."),
+    Strategy(RECENT, "primary", plan_recent, "Grow a new tree from the most recent labelled rows (window size in "
+                                             "Advanced settings). Forgets the old concept."),
+    Strategy(NEWO, "primary", plan_new, "Grow a new tree using only labelled rows collected since the drift started. "
+                                        "Forgets the old concept."),
+    Strategy(BOTH, "primary", plan_both, "Grow a new tree using all historical rows plus the new rows."),
+    Strategy(CONT, "primary", plan_cont, "Keep learning on a copy of the deployed tree: new rows plus a replay sample "
+                                         "of old rows. Existing splits stay."),
     Strategy(KEEP, "primary", plan_keep, "Leave the deployed model untouched."),
-    Strategy(WGT, "advanced", plan_wgt, "Old + new rebuild where new rows count three times."),
-    Strategy(INC, "advanced", plan_inc, "partial_fit on new rows only (SGD/MLP).", needs_partial=True),
-    Strategy(ONL, "advanced", plan_onl, "partial_fit one row at a time (SGD/MLP).", needs_partial=True),
-    Strategy(TRF, "advanced", plan_trf, "Pretrain on the source CSV, fine-tune on new rows.",
-             needs_partial=True, needs_source=True),
+    Strategy(WGT, "advanced", plan_wgt, "Grow a new tree on old + new rows where new rows count three times."),
+    Strategy(INC, "advanced", plan_inc, "Keep learning on a copy of the deployed tree using new rows only."),
+    Strategy(TRF, "advanced", plan_trf, "Grow a tree on the source CSV, then continue on the new rows.",
+             needs_source=True),
 ]
 REG = {s.name: s for s in STRATEGIES}
 PRIMARY = [s.name for s in STRATEGIES if s.tier == "primary"]
@@ -517,25 +480,22 @@ ADVANCED = [s.name for s in STRATEGIES if s.tier == "advanced"]
 
 
 def availability(S, name):
-    sp = REG[name]
-    if sp.needs_partial and not supports_partial(S["family"]):
-        return False, "Random forest has no partial_fit"
-    if sp.needs_source and S["source"] is None:
+    if REG[name].needs_source and S["source"] is None:
         return False, S["src_msg"]
     return True, ""
 
 
 def execute(S, plan):
-    """Training procedure for a plan. Never mutates the deployed model (incremental plans use a deep copy)."""
+    """Training procedure for a plan. Never mutates the deployed model (continue plans use a deep copy)."""
     if plan.kind == "keep":
         return S["model"]
     if plan.kind == "fresh":
-        return fit_new(S, plan.X, plan.y)
+        return fit_new(S, plan.X, plan.y, plan.w)
     rng = np.random.default_rng(S["seed"])
-    if plan.kind == "incremental":
-        return copy.deepcopy(S["model"]).update_batches(plan.X, plan.y, plan.bs, plan.epochs, plan.replay, rng)
+    if plan.kind == "continue":
+        return copy.deepcopy(S["model"]).learn(plan.X, plan.y, plan.replay, rng)
     if plan.kind == "transfer":
-        return fit_new(S, *S["source"]).update_batches(plan.X, plan.y, MB, 3, rng=rng)
+        return fit_new(S, *S["source"]).learn(plan.X, plan.y, rng=rng)
     raise ValueError(f"unknown plan kind {plan.kind}")
 
 
@@ -852,7 +812,7 @@ def sidebar_config(S):
             return
         target = st.selectbox("Target column", df.columns, index=len(df.columns) - 1)
         tcol = st.selectbox("Time column (optional)", ["(row order)"] + [c for c in df.columns if c != target])
-        family = FAMILIES[st.selectbox("Model", list(FAMILIES))]
+        st.caption("Model: Hoeffding tree (river), learns one row at a time.")
         guess = "regression" if (pd.api.types.is_numeric_dtype(df[target]) and df[target].nunique() > 10) else "classification"
         task = st.radio("Task", ["classification", "regression"], index=["classification", "regression"].index(guess),
                         horizontal=True)
@@ -876,6 +836,12 @@ def sidebar_config(S):
                 vc = pd.Series(label_str(tgt)).value_counts()
                 dflt = "1" if "1" in labs else (str(vc.index[-1]) if str(vc.index[-1]) in labs else labs[0])
                 pos = st.selectbox("Fault (positive) class", labs, index=labs.index(dflt))
+            st.markdown("**Hoeffding tree settings**")
+            grace = int(st.number_input("Grace period (rows between split attempts)", 10, 5000, 200, step=10,
+                                        help="Lower = the tree splits sooner and adapts faster, but is noisier."))
+            delta = st.select_slider("Split confidence (delta, smaller = more cautious)", DELTAS, value=1e-7,
+                                     format_func=lambda v: f"{v:.0e}")
+            tau = st.number_input("Tie threshold (tau)", 0.001, 0.5, 0.05, step=0.01, format="%.3f")
             seed = int(st.number_input("Random seed", 0, 10_000, 42))
             src_file = st.file_uploader("Optional: source-domain CSV for transfer learning (same feature columns "
                                         "and target)", type=["csv"], key="src")
@@ -897,9 +863,11 @@ def sidebar_config(S):
                 except Exception as exc:
                     st.warning(f"Source CSV ignored: {exc}")
             cfg = dict(train_pct=train_pct, B=B, z=SENS[sens], delay=delay, min_rows=min_rows, snooze=snooze,
-                       window=window, replay=replay, hold_frac=hold_frac, metric=metric, pos=pos, seed=seed)
+                       window=window, replay=replay, hold_frac=hold_frac, metric=metric, pos=pos, seed=seed,
+                       grace=grace, delta=delta, tau=float(tau))
             try:
-                st.session_state["S"] = init_session(df, target, tcol, family, task, cfg, src_df)
+                with st.spinner("Training the first Hoeffding tree..."):
+                    st.session_state["S"] = init_session(df, target, tcol, task, cfg, src_df)
             except ValueError as exc:
                 st.error(str(exc))
                 return
@@ -910,6 +878,9 @@ def main():
     st.set_page_config(page_title="Model Drift Dashboard", page_icon="📈", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
     st.title("📈 Model Drift Dashboard")
+    if not RIVER_OK:
+        st.error("This app needs the `river` package. Install it with `pip install river` and restart.")
+        st.stop()
     S = st.session_state.get("S")
     sidebar_config(S)
     S = st.session_state.get("S")
@@ -943,7 +914,7 @@ def main():
               else "Drift suspected, collecting data" if al else "Monitoring")
     m = st.columns(4)
     m[0].metric("Batches received", f"{S['k']} / {S['nb']}")
-    m[1].metric("Deployed model", f"v{S['version']}")
+    m[1].metric("Deployed model", f"Hoeffding tree v{S['version']}")
     m[2].metric("Retraining events", len(S["retrains"]))
     m[3].metric("Status", status)
 
