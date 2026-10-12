@@ -1,15 +1,17 @@
-"""Model Drift Dashboard (Hoeffding tree edition).
+"""Model Drift Dashboard (Hoeffding Adaptive Tree edition).
 
-Streams a labelled CSV through ONE deployed model, a Hoeffding tree from `river` (pip install river), detects drift
-from per-batch error, and when drift is confirmed lets the user pick ONE adaptation strategy. Strategy selection is
-separated from training:
+Streams a labelled CSV through ONE deployed model, a Hoeffding Adaptive Tree from `river` (pip install river),
+detects drift from per-batch error, and when drift is confirmed lets the user pick ONE adaptation strategy.
 
     Strategy (registry)  ->  plan function (data selection)  ->  execute() (training procedure)
 
-A Hoeffding tree learns one row at a time and cannot forget what it has already learned. So the strategies fall into
-two groups:
-    * rebuild   : grow a fresh tree on a chosen slice of data (the only way to truly drop the old concept)
-    * continue  : keep learning on a copy of the deployed tree (fast, but old splits stay)
+A Hoeffding Adaptive Tree keeps learning one row at a time and has ADWIN detectors inside its nodes that grow
+alternate subtrees and swap them in when the old branch degrades. So continuing to learn is a genuine adaptation
+strategy, and only four strategies are relevant:
+    * Keep Current Model
+    * Continue Learning       : copy of the deployed tree learns the new rows
+    * Continual Learning      : same, but old rows are replayed alongside the new ones
+    * Recent Window Only      : grow a fresh adaptive tree on the most recent rows
 
 All candidates are trained WITHOUT the newest labelled rows and scored on those same held-out rows.
 The deployed model only changes after Apply succeeds.
@@ -27,10 +29,11 @@ import streamlit as st
 from sklearn.metrics import confusion_matrix, f1_score, precision_recall_fscore_support
 
 try:
+    from river import drift as river_drift
     from river import tree as river_tree
     RIVER_OK = True
 except ImportError:                                   # reported in main()
-    river_tree, RIVER_OK = None, False
+    river_tree, river_drift, RIVER_OK = None, None, False
 
 warnings.filterwarnings("ignore", category=UserWarning, module="river")
 
@@ -38,15 +41,12 @@ warnings.filterwarnings("ignore", category=UserWarning, module="river")
 SENS = {"Low (fewer alerts)": 4.0, "Medium": 3.0, "High (more alerts)": 2.0}
 MB = 64            # replay block size: old rows mixed in after every MB new rows
 MIN_FIT = 30       # minimum usable labelled rows to train a tree
-FIT_CAP = 20000    # max rows used by a single rebuild (keeps the candidate comparison fast)
-NEW_WEIGHT = 3.0   # sample weight of new rows in the weighted strategy
+FIT_CAP = 20000    # max rows used by a single rebuild
 DELTAS = [1e-3, 1e-5, 1e-7, 1e-9]
+ADWIN_DELTAS = [0.1, 0.01, 0.002, 0.0005]
 
-RECENT, NEWO, BOTH, CONT, KEEP = ("Recent Window Only", "New Data Only", "Old + New Data",
-                                  "Continual Learning", "Keep Current Model")
-WGT = "Weighted Old + New (new data 3x)"
-INC = "Continue Learning (new data only)"
-TRF = "Transfer Learning (source CSV)"
+RECENT, CONT, INC, KEEP = ("Recent Window Only", "Continual Learning (new + replay)",
+                           "Continue Learning (new data only)", "Keep Current Model")
 
 METRICS = {
     "classification": ["Error rate", "1 - macro F1", "Fault-class miss rate (1 - recall)"],
@@ -57,15 +57,18 @@ PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
 
 
 # ------------------------------------------------------------------ model
-def make_tree(task, cat, hp):
+def make_tree(task, cat, hp, seed):
     kw = dict(grace_period=int(hp["grace"]), delta=float(hp["delta"]), tau=float(hp["tau"]),
-              nominal_attributes=list(cat) or None)
-    return river_tree.HoeffdingTreeRegressor(**kw) if task == "regression" else river_tree.HoeffdingTreeClassifier(**kw)
+              nominal_attributes=list(cat) or None, drift_window_threshold=int(hp["win_thr"]),
+              drift_detector=river_drift.ADWIN(delta=float(hp["adwin"])), seed=int(seed))
+    if task == "regression":
+        return river_tree.HoeffdingAdaptiveTreeRegressor(**kw)
+    return river_tree.HoeffdingAdaptiveTreeClassifier(**kw)
 
 
 class Bundle:
-    """A Hoeffding tree plus the small amount of preprocessing it needs (median imputation for numeric columns;
-    categorical columns are passed as nominal attributes). Trees need no scaling or one-hot encoding."""
+    """A Hoeffding Adaptive Tree plus the small amount of preprocessing it needs (median imputation for numeric
+    columns; categorical columns are passed as nominal attributes)."""
 
     def __init__(self, task, num, cat, hp, seed):
         self.task, self.num, self.cat, self.hp, self.seed = task, list(num), list(cat), hp, seed
@@ -79,12 +82,12 @@ class Bundle:
             Z[self.num] = Z[self.num].fillna(self.med)
         return Z.to_dict("records")
 
-    def _learn(self, rows, ys, ws=None):
+    def _learn(self, rows, ys):
         reg = self.task == "regression"
-        for i, (x, t) in enumerate(zip(rows, ys)):
-            self.tree.learn_one(x, float(t) if reg else str(t), w=1.0 if ws is None else float(ws[i]))
+        for x, t in zip(rows, ys):
+            self.tree.learn_one(x, float(t) if reg else str(t))
 
-    def fit(self, X, y, w=None):
+    def fit(self, X, y):
         """Brand-new tree trained in one pass, in the given (time) order."""
         y = np.asarray(y)
         if len(y) != len(X):
@@ -97,13 +100,13 @@ class Bundle:
         else:
             self.major = str(pd.Series(y).mode().iloc[0])
         self.med = {c: (float(X[c].median()) if X[c].notna().any() else 0.0) for c in self.num}
-        self.tree = make_tree(self.task, self.cat, self.hp)
-        self._learn(self._rows(X), y, w)
+        self.tree = make_tree(self.task, self.cat, self.hp, self.seed)
+        self._learn(self._rows(X), y)
         return self
 
     def learn(self, X, y, replay=None, rng=None):
-        """Keep learning on the existing tree (and its medians). Optionally mixes a random replay sample of old rows
-        in after every MB new rows."""
+        """Keep learning on the existing tree. Optionally mixes a random replay sample of old rows in after
+        every MB new rows."""
         y = np.asarray(y)
         if len(y) == 0:
             raise ValueError("no labelled rows to learn from")
@@ -140,7 +143,7 @@ def ref_stats(task, e):
     return m, max(s, 0.1 * m, 1e-9)
 
 
-def fit_new(S, X, y, w=None, cap=FIT_CAP):
+def fit_new(S, X, y, cap=FIT_CAP):
     """Fresh tree: imputation values are computed from exactly (X, y)."""
     if len(y) == 0:
         raise ValueError("no training rows selected")
@@ -149,8 +152,7 @@ def fit_new(S, X, y, w=None, cap=FIT_CAP):
     if len(y) > cap:
         pick = np.sort(np.random.default_rng(S["seed"]).choice(len(y), cap, replace=False))
         X, y = X.iloc[pick], y[pick]
-        w = None if w is None else np.asarray(w)[pick]
-    return Bundle(S["task"], S["num"], S["cat"], S["hp"], S["seed"]).fit(X, y, w)
+    return Bundle(S["task"], S["num"], S["cat"], S["hp"], S["seed"]).fit(X, y)
 
 
 # ------------------------------------------------------------------ metrics
@@ -232,34 +234,8 @@ def pick_features(df, exclude):
     return num, cat
 
 
-def prepare_source(sd, num, cat, target, task, classes):
-    """Validate the optional source-domain CSV. Returns ((X, y) or None, message)."""
-    miss = [c for c in num + cat + [target] if c not in sd.columns]
-    if miss:
-        return None, f"source CSV is missing columns {miss}"
-    sd = sd[sd[target].notna()].reset_index(drop=True)
-    if task == "regression":
-        sy = pd.to_numeric(sd[target], errors="coerce").to_numpy(float)
-        ok = np.isfinite(sy)
-    else:
-        sy = label_str(sd[target])
-        ok = np.isin(sy, classes)
-    dropped = int((~ok).sum())
-    sx = build_frame(sd, num, cat)[ok].reset_index(drop=True)
-    sy = sy[ok]
-    if len(sy) < 50:
-        return None, f"only {len(sy)} usable source rows (need 50)"
-    empty = [c for c in num if sx[c].notna().sum() == 0]
-    if empty:
-        return None, f"source CSV has no usable values in columns {empty}"
-    if task == "classification" and len(np.unique(sy)) < 2:
-        return None, "source CSV contains only one target class"
-    note = f"{len(sy):,} source rows" + (f" ({dropped:,} dropped: invalid or unknown labels)" if dropped else "")
-    return (sx, sy), note
-
-
 # ------------------------------------------------------------------ session setup (UI independent)
-def init_session(df, target, tcol, task, cfg, src_df=None):
+def init_session(df, target, tcol, task, cfg):
     """Build the monitoring session dict. Raises ValueError with a readable message on bad input."""
     if not RIVER_OK:
         raise ValueError("The `river` package is not installed (pip install river).")
@@ -288,25 +264,19 @@ def init_session(df, target, tcol, task, cfg, src_df=None):
     if not (num or cat):
         raise ValueError("No usable feature columns were found.")
     X = build_frame(d, num, cat)
-    classes0 = np.unique(y[:n_tr]) if task == "classification" else None
     pos = cfg.get("pos")
     if task == "classification" and pos is None:
         vals, cnt = np.unique(y, return_counts=True)
         pos = str(vals[np.argmin(cnt)])
-    source, src_msg = None, "no source CSV was uploaded"
-    if src_df is not None:
-        try:
-            source, src_msg = prepare_source(src_df, num, cat, target, task, classes0)
-        except Exception as exc:
-            source, src_msg = None, f"could not use the source CSV: {exc}"
-    hp = dict(grace=int(cfg.get("grace", 200)), delta=float(cfg.get("delta", 1e-7)), tau=float(cfg.get("tau", 0.05)))
-    S = dict(X=X, y=y, task=task, num=num, cat=cat, hp=hp, seed=int(cfg.get("seed", 42)), n_tr=n_tr, B=B,
+    hp = dict(grace=int(cfg["grace"]), delta=float(cfg["delta"]), tau=float(cfg["tau"]),
+              adwin=float(cfg["adwin"]), win_thr=int(cfg["win_thr"]))
+    S = dict(X=X, y=y, task=task, num=num, cat=cat, hp=hp, seed=int(cfg["seed"]), n_tr=n_tr, B=B,
              N=len(y) - n_tr, nb=int(np.ceil((len(y) - n_tr) / B)), z=cfg["z"], delay=int(cfg["delay"]),
              min_rows=int(cfg["min_rows"]), snooze=int(cfg["snooze"]), window=int(cfg["window"]),
              replay=int(cfg["replay"]), hold_frac=float(cfg["hold_frac"]),
-             metric=cfg.get("metric") or METRICS[task][0], pos=pos, classes0=classes0,
+             metric=cfg.get("metric") or METRICS[task][0], pos=pos,
              version=0, k=0, errs=[], thr=[], ver=[], bad=[], good=0, alert=None, snooze_until=0,
-             cand=None, events=[], retrains=[], comps=[], source=source, src_msg=src_msg, flash=None)
+             cand=None, events=[], retrains=[], flash=None)
     try:
         S["model"] = Bundle(task, num, cat, hp, S["seed"]).fit(X.iloc[:n_fit], y[:n_fit])
     except Exception as exc:
@@ -334,7 +304,7 @@ def step(S):
     """Receive one batch: predict with the deployed model, then judge the batch whose labels just arrived."""
     k, B, n_tr = S["k"], S["B"], S["n_tr"]
     a, b = n_tr + k * B, min(n_tr + (k + 1) * B, len(S["y"]))
-    if b <= a:                                           # empty batch: nothing left to stream
+    if b <= a:
         S["k"] = S["nb"]
         return
     e = row_err(S["task"], S["y"][a:b], S["model"].predict(S["X"].iloc[a:b]))
@@ -384,10 +354,9 @@ def get_data(S):
 # ------------------------------------------------------------------ strategies: data selection -> training
 @dataclass
 class Plan:
-    kind: str                       # keep | fresh | continue | transfer
+    kind: str                       # keep | fresh | continue
     X: Optional[pd.DataFrame] = None
     y: Optional[np.ndarray] = None
-    w: Optional[np.ndarray] = None  # per-row sample weights (fresh only)
     replay: Optional[tuple] = None
     note: str = ""
 
@@ -395,14 +364,8 @@ class Plan:
 @dataclass
 class Strategy:
     name: str
-    tier: str                       # primary | advanced
     plan: Callable
     blurb: str
-    needs_source: bool = False
-
-
-def _stack(X1, X2):
-    return pd.concat([X1, X2]).reset_index(drop=True)
 
 
 def replay_sample(y, n, rng, task):
@@ -419,41 +382,23 @@ def replay_sample(y, n, rng, task):
 
 
 def plan_recent(S, Xo, yo, Xn, yn):
-    Xa, ya = _stack(Xo, Xn), np.concatenate([yo, yn])
+    Xa, ya = pd.concat([Xo, Xn]).reset_index(drop=True), np.concatenate([yo, yn])
     w = min(len(ya), S["window"])
-    return Plan("fresh", Xa.iloc[-w:], ya[-w:], note=f"new tree grown on the most recent {w:,} labelled rows")
-
-
-def plan_new(S, Xo, yo, Xn, yn):
-    return Plan("fresh", Xn, yn, note=f"new tree grown on {len(yn):,} post-drift rows only")
-
-
-def plan_both(S, Xo, yo, Xn, yn):
-    return Plan("fresh", _stack(Xo, Xn), np.concatenate([yo, yn]),
-                note=f"new tree grown on all {len(yo):,} old + {len(yn):,} new rows")
+    return Plan("fresh", Xa.iloc[-w:], ya[-w:], note=f"new adaptive tree grown on the most recent {w:,} labelled rows")
 
 
 def plan_cont(S, Xo, yo, Xn, yn):
-    rng = np.random.default_rng(S["seed"])
-    idx = replay_sample(yo, S["replay"], rng, S["task"])
+    idx = replay_sample(yo, S["replay"], np.random.default_rng(S["seed"]), S["task"])
     rX, ry = Xo.iloc[idx], yo[idx]
     return Plan("continue", Xn, yn, replay=(rX, ry),
                 note=f"copy of the deployed tree keeps learning from {len(yn):,} new rows; after every {MB} new rows "
-                     f"it also sees {MB} random old rows (replay pool of {len(ry):,})")
-
-
-def plan_wgt(S, Xo, yo, Xn, yn):
-    w = np.concatenate([np.ones(len(yo)), np.full(len(yn), NEW_WEIGHT)])
-    return Plan("fresh", _stack(Xo, Xn), np.concatenate([yo, yn]), w=w,
-                note=f"new tree grown on old rows (weight 1) + new rows (weight {NEW_WEIGHT:g})")
+                     f"it also sees {MB} random old rows (replay pool of {len(ry):,}). Its ADWIN detectors can "
+                     "still replace outdated branches")
 
 
 def plan_inc(S, Xo, yo, Xn, yn):
-    return Plan("continue", Xn, yn, note=f"copy of the deployed tree keeps learning from {len(yn):,} new rows")
-
-
-def plan_trf(S, Xo, yo, Xn, yn):
-    return Plan("transfer", Xn, yn, note="new tree grown on the source CSV, then continues on the new rows")
+    return Plan("continue", Xn, yn, note=f"copy of the deployed tree keeps learning from {len(yn):,} new rows; its "
+                                         "ADWIN detectors can replace outdated branches")
 
 
 def plan_keep(S, Xo, yo, Xn, yn):
@@ -461,28 +406,15 @@ def plan_keep(S, Xo, yo, Xn, yn):
 
 
 STRATEGIES = [
-    Strategy(RECENT, "primary", plan_recent, "Grow a new tree from the most recent labelled rows (window size in "
-                                             "Advanced settings). Forgets the old concept."),
-    Strategy(NEWO, "primary", plan_new, "Grow a new tree using only labelled rows collected since the drift started. "
-                                        "Forgets the old concept."),
-    Strategy(BOTH, "primary", plan_both, "Grow a new tree using all historical rows plus the new rows."),
-    Strategy(CONT, "primary", plan_cont, "Keep learning on a copy of the deployed tree: new rows plus a replay sample "
-                                         "of old rows. Existing splits stay."),
-    Strategy(KEEP, "primary", plan_keep, "Leave the deployed model untouched."),
-    Strategy(WGT, "advanced", plan_wgt, "Grow a new tree on old + new rows where new rows count three times."),
-    Strategy(INC, "advanced", plan_inc, "Keep learning on a copy of the deployed tree using new rows only."),
-    Strategy(TRF, "advanced", plan_trf, "Grow a tree on the source CSV, then continue on the new rows.",
-             needs_source=True),
+    Strategy(INC, plan_inc, "Keep learning on a copy of the deployed tree using only the new rows. Fastest option; "
+                            "the tree's own drift detectors swap out branches that stopped working."),
+    Strategy(CONT, plan_cont, "Same as above, but a random sample of old rows is replayed alongside the new rows "
+                              "so useful old knowledge is not lost."),
+    Strategy(RECENT, plan_recent, "Grow a brand-new adaptive tree from the most recent labelled rows (window size in "
+                                  "Advanced settings). Drops the old concept completely."),
+    Strategy(KEEP, plan_keep, "Leave the deployed model untouched."),
 ]
 REG = {s.name: s for s in STRATEGIES}
-PRIMARY = [s.name for s in STRATEGIES if s.tier == "primary"]
-ADVANCED = [s.name for s in STRATEGIES if s.tier == "advanced"]
-
-
-def availability(S, name):
-    if REG[name].needs_source and S["source"] is None:
-        return False, S["src_msg"]
-    return True, ""
 
 
 def execute(S, plan):
@@ -490,12 +422,9 @@ def execute(S, plan):
     if plan.kind == "keep":
         return S["model"]
     if plan.kind == "fresh":
-        return fit_new(S, plan.X, plan.y, plan.w)
-    rng = np.random.default_rng(S["seed"])
+        return fit_new(S, plan.X, plan.y)
     if plan.kind == "continue":
-        return copy.deepcopy(S["model"]).learn(plan.X, plan.y, plan.replay, rng)
-    if plan.kind == "transfer":
-        return fit_new(S, *S["source"]).learn(plan.X, plan.y, rng=rng)
+        return copy.deepcopy(S["model"]).learn(plan.X, plan.y, plan.replay, np.random.default_rng(S["seed"]))
     raise ValueError(f"unknown plan kind {plan.kind}")
 
 
@@ -506,7 +435,7 @@ def build(S, name, data):
 
 # ------------------------------------------------------------------ candidate comparison and decisions
 def compute_cands(S):
-    """Train every available strategy WITHOUT the newest labelled rows and score all of them on those rows."""
+    """Train every strategy WITHOUT the newest labelled rows and score all of them on those rows."""
     Xo, yo, Xn, yn = get_data(S)
     n = len(yn)
     if n < 2 * MIN_FIT:
@@ -515,12 +444,8 @@ def compute_cands(S):
     hold = int(np.clip(round(n * S["hold_frac"]), MIN_FIT, n - MIN_FIT))
     Xh, yh, Xt, yt = Xn.iloc[-hold:], yn[-hold:], Xn.iloc[:-hold], yn[:-hold]
     task, pos = S["task"], S["pos"]
-    mets, errs, preds, notes, unavailable, failed = {}, {}, {}, {}, [], []
+    mets, errs, preds, notes, failed = {}, {}, {}, {}, []
     for sp in STRATEGIES:
-        ok, why = availability(S, sp.name)
-        if not ok:
-            unavailable.append((sp.name, why))
-            continue
         try:
             model, note = build(S, sp.name, (Xo, yo, Xt, yt))
             p = model.predict(Xh)
@@ -542,8 +467,7 @@ def compute_cands(S):
         if sp.name not in mets:
             continue
         m = mets[sp.name]
-        row = {"Strategy": sp.name, "Type": "Advanced" if sp.tier == "advanced" else "Primary",
-               "Selection score": selection_score(metric, m)}
+        row = {"Strategy": sp.name, "Selection score": selection_score(metric, m)}
         if task == "regression":
             row.update({"MAE": m["mae"], "RMSE": m["rmse"]})
         else:
@@ -578,22 +502,20 @@ def compute_cands(S):
     k_s = float(t.loc[t["Strategy"] == KEEP, "Selection score"].iloc[0])
     r_s = float(t.loc[t["Strategy"] == rec, "Selection score"].iloc[0])
     if rec == KEEP:
-        why = (f"**Recommended: {KEEP}.** No retraining candidate had a lower held-out {metric} "
+        why = (f"**Recommended: {KEEP}.** No candidate had a lower held-out {metric} "
                f"({k_s:.4f}) than the current model.")
     else:
         why = (f"**Recommended: {rec}.** It had the lowest held-out {metric} ({r_s:.4f} vs {k_s:.4f} for the current "
                f"model) among candidates that ran successfully.")
     why += f" This is a measurement on {hold:,} recent labelled rows, not a guarantee for future data."
     return dict(table=t, errs=errs, preds=preds, yh=yh, notes=notes, hold=hold, n_old=len(yo), n_new=n,
-                n_train=len(yt), unavailable=unavailable, failed=failed, metric=metric, warnings=warns,
-                rec=rec, why=why)
+                n_train=len(yt), failed=failed, metric=metric, warnings=warns, rec=rec, why=why)
 
 
 def apply_choice(S, name):
     """Apply a decision. Returns (ok, message). The deployed model and version change only on success."""
     c, al = S["cand"], S["alert"]
     if name == KEEP:
-        S["comps"].append(c["table"].assign(Decision=len(S["comps"]) + 1, Metric=c["metric"]))
         S["snooze_until"] = S["k"] + S["snooze"]
         log(S, "Kept current model", f"no alerts for {S['snooze']} batches")
         msg = f"Kept the current model (v{S['version']}). No new alerts for {S['snooze']} batches."
@@ -613,7 +535,6 @@ def apply_choice(S, name):
         t = c["table"].set_index("Strategy")["Selection score"]
         S["retrains"].append(dict(version=S["version"], strategy=name, applied=S["k"], start=al["start"],
                                   score_new=float(t[name]), score_keep=float(t[KEEP]), metric=c["metric"]))
-        S["comps"].append(c["table"].assign(Decision=len(S["comps"]) + 1, Metric=c["metric"]))
         log(S, "Retrained", f"v{S['version']} = {name} (old {c['n_old']:,} rows, new {c['n_new']:,} rows)")
         msg = f"Deployed model v{S['version']} ({name})."
     S["alert"], S["cand"], S["bad"], S["good"] = None, None, [], 0
@@ -711,23 +632,11 @@ def decision_panel(S):
         for w in c["warnings"]:
             st.warning(w)
         score = dict(zip(t["Strategy"], t["Selection score"]))
-        valid = lambda n: n in score and np.isfinite(score[n])
-        prim = [n for n in PRIMARY if valid(n)]
-        adv = [n for n in ADVANCED if valid(n)]
-        fmt = lambda n: f"{n}  ({score[n]:.4f})"
-        rec_adv = c["rec"] in adv
-        default_prim = prim.index(c["rec"]) if c["rec"] in prim else prim.index(KEEP)
+        opts = [s.name for s in STRATEGIES if s.name in score and np.isfinite(score[s.name])]
         k = S["k"]
-        choice = st.radio("Strategy (held-out score in brackets)", prim, index=default_prim, format_func=fmt,
-                          key=f"prim_{k}")
-        if adv:
-            with st.expander("Advanced strategies", expanded=rec_adv):
-                adv_pick = st.selectbox("Use an advanced strategy instead of the selection above",
-                                        ["(none)"] + adv, index=(adv.index(c["rec"]) + 1) if rec_adv else 0,
-                                        format_func=lambda n: n if n == "(none)" else fmt(n), key=f"adv_{k}")
-            if adv_pick != "(none)":
-                choice = adv_pick
-        st.caption(f"Selected: **{choice}**. {REG[choice].blurb}  \nHow it will be built: {c['notes'][choice]}.")
+        choice = st.radio("Strategy (held-out score in brackets)", opts, index=opts.index(c["rec"]),
+                          format_func=lambda n: f"{n}  ({score[n]:.4f})", key=f"pick_{k}")
+        st.caption(f"{REG[choice].blurb}  \nHow it will be built: {c['notes'][choice]}.")
         a1, a2, _ = st.columns([1.2, 1.6, 3])
         if a1.button("Apply", type="primary", disabled=choice == KEEP, key=f"apply_{k}",
                      help="Keep Current Model is confirmed with the Skip button." if choice == KEEP else None):
@@ -738,12 +647,10 @@ def decision_panel(S):
             ok, msg = apply_choice(S, KEEP)
             S["flash"] = ("info", msg)
             st.rerun()
-        if c["unavailable"]:
-            st.caption("Not available with this setup: " + "; ".join(f"{n} ({why})" for n, why in c["unavailable"]))
         if c["failed"]:
             st.caption("Failed to build, excluded from the ranking: " + "; ".join(f"{n} ({why})" for n, why in c["failed"]))
         with st.expander("Detailed held-out metrics and confusion matrix"):
-            wide(st.dataframe, t.drop(columns=["Type"]).round(4), hide_index=True)
+            wide(st.dataframe, t.round(4), hide_index=True)
             if S["task"] == "classification":
                 st.caption(f"Fault class = '{S['pos']}'. Precision/recall/F1 are for that class.")
                 st.write(f"Confusion matrix: {choice}")
@@ -771,27 +678,6 @@ def retrain_results(S):
                f"({unit}). Early live numbers cover few batches, so read them with care.")
 
 
-def history_panel(S):
-    allc = pd.concat([c for c in S["comps"] if len(c)])
-    lb = (allc.groupby("Strategy").agg(avg_gain=("Better than keeping (%)", "mean"), n=("Decision", "count"))
-          .reset_index().sort_values("avg_gain", ascending=False))
-    fig = go.Figure(go.Bar(x=lb["avg_gain"], y=lb["Strategy"], orientation="h", text=lb["avg_gain"].round(1),
-                           marker_color=["#9e9e9e" if n == KEEP else "#2e7d32" for n in lb["Strategy"]]))
-    fig.update_layout(title="Average improvement vs keeping the current model (%, higher is better)",
-                      yaxis=dict(autorange="reversed"), height=60 + 36 * len(lb), margin=dict(t=45, b=30))
-    wide(st.plotly_chart, fig)
-    cand = lb[lb["Strategy"] != KEEP]
-    cand = cand[np.isfinite(cand["avg_gain"])]
-    if len(cand) and cand.iloc[0]["avg_gain"] > 0:
-        top = cand.iloc[0]
-        st.success(f"Best so far: **{top['Strategy']}**, averaging {top['avg_gain']:+.1f}% vs keeping the model "
-                   f"across {int(top['n'])} drift decision(s). More drift events make this ranking more reliable.")
-    else:
-        st.info("No retraining strategy has beaten keeping the current model yet.")
-    if allc["Metric"].nunique() > 1:
-        st.caption("Decisions used different selection metrics because a fallback was applied; read with care.")
-
-
 # ------------------------------------------------------------------ app
 CSS = """<style>
 .block-container{padding-top:1.4rem;padding-bottom:1.5rem}
@@ -812,7 +698,7 @@ def sidebar_config(S):
             return
         target = st.selectbox("Target column", df.columns, index=len(df.columns) - 1)
         tcol = st.selectbox("Time column (optional)", ["(row order)"] + [c for c in df.columns if c != target])
-        st.caption("Model: Hoeffding tree (river), learns one row at a time.")
+        st.caption("Model: Hoeffding Adaptive Tree (river), learns one row at a time and adapts to drift internally.")
         guess = "regression" if (pd.api.types.is_numeric_dtype(df[target]) and df[target].nunique() > 10) else "classification"
         task = st.radio("Task", ["classification", "regression"], index=["classification", "regression"].index(guess),
                         horizontal=True)
@@ -836,15 +722,18 @@ def sidebar_config(S):
                 vc = pd.Series(label_str(tgt)).value_counts()
                 dflt = "1" if "1" in labs else (str(vc.index[-1]) if str(vc.index[-1]) in labs else labs[0])
                 pos = st.selectbox("Fault (positive) class", labs, index=labs.index(dflt))
-            st.markdown("**Hoeffding tree settings**")
+            st.markdown("**Hoeffding Adaptive Tree settings**")
             grace = int(st.number_input("Grace period (rows between split attempts)", 10, 5000, 200, step=10,
                                         help="Lower = the tree splits sooner and adapts faster, but is noisier."))
             delta = st.select_slider("Split confidence (delta, smaller = more cautious)", DELTAS, value=1e-7,
                                      format_func=lambda v: f"{v:.0e}")
             tau = st.number_input("Tie threshold (tau)", 0.001, 0.5, 0.05, step=0.01, format="%.3f")
+            adwin = st.select_slider("ADWIN sensitivity (larger = reacts to drift sooner)", ADWIN_DELTAS, value=0.002,
+                                     help="Confidence of the drift detector inside each tree node.")
+            win_thr = int(st.number_input("Alternate-tree window (rows)", 50, 5000, 300, step=50,
+                                          help="Rows an alternate subtree must see before it can replace "
+                                               "the original branch."))
             seed = int(st.number_input("Random seed", 0, 10_000, 42))
-            src_file = st.file_uploader("Optional: source-domain CSV for transfer learning (same feature columns "
-                                        "and target)", type=["csv"], key="src")
         running = S is not None and S["k"] > 0
         go_ = False
         if st.button("Restart with these settings" if S is not None else "Start monitoring", type="primary"):
@@ -856,18 +745,12 @@ def sidebar_config(S):
                        "Yes, restart"):
             go_ = True
         if go_:
-            src_df = None
-            if src_file is not None:
-                try:
-                    src_df = read(src_file.getvalue())
-                except Exception as exc:
-                    st.warning(f"Source CSV ignored: {exc}")
             cfg = dict(train_pct=train_pct, B=B, z=SENS[sens], delay=delay, min_rows=min_rows, snooze=snooze,
                        window=window, replay=replay, hold_frac=hold_frac, metric=metric, pos=pos, seed=seed,
-                       grace=grace, delta=delta, tau=float(tau))
+                       grace=grace, delta=delta, tau=float(tau), adwin=adwin, win_thr=win_thr)
             try:
-                with st.spinner("Training the first Hoeffding tree..."):
-                    st.session_state["S"] = init_session(df, target, tcol, task, cfg, src_df)
+                with st.spinner("Training the first Hoeffding Adaptive Tree..."):
+                    st.session_state["S"] = init_session(df, target, tcol, task, cfg)
             except ValueError as exc:
                 st.error(str(exc))
                 return
@@ -888,7 +771,7 @@ def main():
         st.info("Upload a CSV in the sidebar, choose your columns and click **Start monitoring**.")
         st.stop()
 
-    done, al = S["k"] >= S["nb"], S["alert"]
+    done = S["k"] >= S["nb"]
     off = ready(S) or done
     with st.container(border=True):
         b0, b1, b2, b3 = st.columns([2.4, 1, 1, 1])
@@ -914,7 +797,7 @@ def main():
               else "Drift suspected, collecting data" if al else "Monitoring")
     m = st.columns(4)
     m[0].metric("Batches received", f"{S['k']} / {S['nb']}")
-    m[1].metric("Deployed model", f"Hoeffding tree v{S['version']}")
+    m[1].metric("Deployed model", f"Adaptive tree v{S['version']}")
     m[2].metric("Retraining events", len(S["retrains"]))
     m[3].metric("Status", status)
 
@@ -933,7 +816,7 @@ def main():
 
     if ready(S):
         if S["cand"] is None:
-            with st.spinner("Testing every retraining option on the newest labelled rows..."):
+            with st.spinner("Testing every adaptation option on the newest labelled rows..."):
                 try:
                     S["cand"] = compute_cands(S)
                 except Exception as exc:
@@ -945,9 +828,6 @@ def main():
     if S["events"]:
         with st.expander("Event log", expanded=False):
             wide(st.dataframe, pd.DataFrame(S["events"]), hide_index=True)
-    if S["comps"]:
-        with st.expander("Historical strategy comparison", expanded=False):
-            history_panel(S)
 
 
 if __name__ == "__main__":
