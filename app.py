@@ -11,6 +11,8 @@ st.set_page_config(page_title="Model Drift Dashboard", layout="wide")
 
 TASKS = ["Regression", "Classification"]
 WARMUP, WINDOW, REPLAY, PLOT_WIN = 30, 200, 100, 50
+REFRESH = 0.35
+MAX_BATCH = 30
 STATUS = {
     "Normal": "🟢 Normal",
     "Drift Detected": "🔴 Drift Detected",
@@ -154,15 +156,16 @@ def step(s):
 
 
 def figure(s):
-    k = max(1, len(s["xs"]) // 2000)
+    k = max(1, len(s["xs"]) // 1500)
     dx = [v for d, _ in s["drifts"] for v in (d, d, None)]
-    dy = [v for _ in s["drifts"] for v in (0, 1, None)]
+    dy = [v for _ in s["drifts"] for v in (0, 1.02, None)]
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=s["xs"][::k], y=s["ys"][::k], mode="lines",
         line=dict(color="#1f77b4", width=2), name="Error"))
     fig.add_trace(go.Scatter(
-        x=dx, y=dy, mode="lines", line=dict(color="rgba(214,39,40,0.6)", width=1.5, dash="dash"),
+        x=dx, y=dy, mode="lines",
+        line=dict(color="rgba(214,39,40,0.6)", width=1.5, dash="dash"),
         hoverinfo="skip", name="Drift"))
     fig.add_trace(go.Scatter(
         x=[d for d, _ in s["drifts"]], y=[v for _, v in s["drifts"]], mode="markers",
@@ -170,8 +173,9 @@ def figure(s):
     fig.update_layout(
         height=380, margin=dict(l=10, r=10, t=10, b=10), showlegend=False,
         template="plotly_white", uirevision="keep", hovermode="x",
-        xaxis=dict(range=[0, len(s["y"])], title="Samples"),
-        yaxis=dict(range=[0, 1.02], title=f"Rolling error (last {PLOT_WIN})"),
+        transition=dict(duration=0),
+        xaxis=dict(range=[0, len(s["y"])], title="Samples", fixedrange=True),
+        yaxis=dict(range=[0, 1.02], title=f"Rolling error (last {PLOT_WIN})", fixedrange=True),
     )
     return fig
 
@@ -185,7 +189,7 @@ def render(s, ph):
     ph["m"].metric(
         f'{"MAE" if reg else "Accuracy"} (last {WINDOW})',
         f"{val:.3f}" if reg else f"{val:.1%}")
-    cfg = {"displayModeBar": False}
+    cfg = {"displayModeBar": False, "staticPlot": False}
     try:
         ph["chart"].plotly_chart(figure(s), width="stretch", config=cfg)
     except TypeError:
@@ -213,13 +217,21 @@ ph = {"status": m1.empty(), "n": m2.empty(), "d": m3.empty(), "m": m4.empty(), "
 render(s, ph)
 
 delay = st.session_state.get("delay", 50) / 1000
+batch = MAX_BATCH if delay <= 0 else int(min(MAX_BATCH, max(1, round(REFRESH / delay))))
+
 while s["running"] and s["i"] < len(s["y"]):
     if s["pending"]:
         retrain(s)
         render(s, ph)
-    step(s)
+    for _ in range(batch):
+        if s["i"] >= len(s["y"]):
+            break
+        step(s)
+        if delay > 0:
+            time.sleep(delay)
+        if s["pending"]:
+            break
     render(s, ph)
-    time.sleep(delay)
 
 if s["running"]:
     s["running"] = False
