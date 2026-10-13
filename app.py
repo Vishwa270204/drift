@@ -1,769 +1,835 @@
-"""Model Drift Dashboard (Hoeffding Adaptive Tree edition).
+"""Model Drift Detection Dashboard (single file).
 
-Streams a labelled CSV through ONE deployed model, a Hoeffding Adaptive Tree from `river` (pip install river),
-detects drift from per-batch error, and when drift is confirmed lets the user apply ONE adaptation technique:
-online incremental learning.
+Detects drift with ADWIN (on prequential prediction errors) and PSI (per-feature
+distribution shift), and compares learning strategies that adapt a model:
 
-    Strategy (registry)  ->  plan function (data selection)  ->  execute() (training procedure)
+    Static (baseline), Incremental, Online, Continual, Transfer (+ a scratch baseline)
 
-A Hoeffding Adaptive Tree keeps learning one row at a time and has ADWIN detectors inside its nodes that grow
-alternate subtrees and swap them in when the old branch degrades. The only adaptation offered is:
-    * Continue Learning : copy of the deployed tree learns the new rows incrementally
-    * Keep Current Model: baseline / skip option
+Protocol (identical for every strategy, strictly chronological):
+    1. The first N% of rows are the REFERENCE period. A source model is trained on it.
+    2. The remaining rows are replayed as consecutive WINDOWS.
+    3. For every window: every model PREDICTS first (nothing has been trained on
+       this window yet), then labels "arrive", detectors run, and models may update.
+    4. A drift signal at the end of window t switches adaptation on for the next
+       k windows (or adaptation can run on every window). Detection and adaptation
+       are separate steps: a signal never retrains anything by itself.
 
-The candidate is trained WITHOUT the newest labelled rows and scored on those same held-out rows.
-The deployed model only changes after Apply succeeds.
+Run:  streamlit run app.py
 """
+
 import copy
-import io
+import os
+import time
 import warnings
-from dataclasses import dataclass
-from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.metrics import confusion_matrix, f1_score, precision_recall_fscore_support
+from river.drift import ADWIN
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import SGDClassifier, SGDRegressor
+from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
 
-try:
-    from river import drift as river_drift
-    from river import tree as river_tree
-    RIVER_OK = True
-except ImportError:                                   # reported in main()
-    river_tree, river_drift, RIVER_OK = None, None, False
+DEFAULT_CSV_PATH = "data.csv"
 
-warnings.filterwarnings("ignore", category=UserWarning, module="river")
+# ----------------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------------
+PSI_EPS = 1e-4          # replaces zero proportions in PSI
+PSI_BINS = 10           # quantile bins for numeric features
+MAX_CAT_LEVELS = 20     # categories kept per categorical feature (rest -> "unseen" bucket)
+MAX_CAT_UNIQUE = 50     # categorical columns with more levels are treated as ID-like and excluded
+TARGET_CAP = 2000       # most recent labelled target-period rows kept for Transfer / Scratch
+TRANSFER_EPOCHS = 3     # passes over the target buffer per Transfer / Scratch update
+SEED = 42
 
-# ------------------------------------------------------------------ constants
-SENS = {"Low (fewer alerts)": 4.0, "Medium": 3.0, "High (more alerts)": 2.0}
-MIN_FIT = 30       # minimum usable labelled rows to train a tree
-DELTAS = [1e-3, 1e-5, 1e-7, 1e-9]
-ADWIN_DELTAS = [0.1, 0.01, 0.002, 0.0005]
+STATIC = "Static (no adaptation)"
+INCR = "Incremental"
+ONLINE = "Online"
+CONT = "Continual"
+TRANS = "Transfer"
+SCRATCH = "Scratch (target-only baseline)"
+LEARNERS = [INCR, ONLINE, CONT, TRANS]
 
-INC, KEEP = "Continue Learning (new data only)", "Keep Current Model"
-
-METRICS = {
-    "classification": ["Error rate", "1 - macro F1", "Fault-class miss rate (1 - recall)"],
-    "regression": ["MAE", "RMSE"],
-}
-ROW_WISE = {"Error rate", "MAE"}   # metrics with a per-row loss (paired noise check possible)
-PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
-
-
-# ------------------------------------------------------------------ model
-def make_tree(task, cat, hp, seed):
-    kw = dict(grace_period=int(hp["grace"]), delta=float(hp["delta"]), tau=float(hp["tau"]),
-              nominal_attributes=list(cat) or None, drift_window_threshold=int(hp["win_thr"]),
-              drift_detector=river_drift.ADWIN(delta=float(hp["adwin"])), seed=int(seed))
-    if task == "regression":
-        return river_tree.HoeffdingAdaptiveTreeRegressor(**kw)
-    return river_tree.HoeffdingAdaptiveTreeClassifier(**kw)
+st.set_page_config(page_title="Model Drift Dashboard", layout="wide")
 
 
-class Bundle:
-    """A Hoeffding Adaptive Tree plus the small amount of preprocessing it needs (median imputation for numeric
-    columns; categorical columns are passed as nominal attributes)."""
-
-    def __init__(self, task, num, cat, hp, seed):
-        self.task, self.num, self.cat, self.hp, self.seed = task, list(num), list(cat), hp, seed
-        self.cols = self.num + self.cat
-        self.med, self.major, self.tree = {}, None, None
-
-    def _rows(self, X):
-        Z = X[self.cols]
-        if self.num:
-            Z = Z.copy()
-            Z[self.num] = Z[self.num].fillna(self.med)
-        return Z.to_dict("records")
-
-    def _learn(self, rows, ys):
-        reg = self.task == "regression"
-        for x, t in zip(rows, ys):
-            self.tree.learn_one(x, float(t) if reg else str(t))
-
-    def fit(self, X, y):
-        """Initial tree trained in one pass, in the given (time) order."""
-        y = np.asarray(y)
-        if len(y) != len(X):
-            raise ValueError("features and target have different lengths")
-        if len(y) < MIN_FIT:
-            raise ValueError(f"only {len(y)} usable labelled rows (need at least {MIN_FIT})")
-        if self.task == "regression":
-            if not np.all(np.isfinite(y.astype(float))):
-                raise ValueError("target contains non-finite values")
-        else:
-            self.major = str(pd.Series(y).mode().iloc[0])
-        self.med = {c: (float(X[c].median()) if X[c].notna().any() else 0.0) for c in self.num}
-        self.tree = make_tree(self.task, self.cat, self.hp, self.seed)
-        self._learn(self._rows(X), y)
-        return self
-
-    def learn(self, X, y):
-        """Keep learning incrementally on the existing tree, one row at a time."""
-        y = np.asarray(y)
-        if len(y) == 0:
-            raise ValueError("no labelled rows to learn from")
-        self._learn(self._rows(X), y)
-        return self
-
-    def predict(self, X):
-        reg = self.task == "regression"
-        out = []
-        for x in self._rows(X):
-            p = self.tree.predict_one(x)
-            out.append((0.0 if p is None else float(p)) if reg else (self.major if p is None else str(p)))
-        return np.asarray(out, float) if reg else np.asarray(out).astype(str)
+# ----------------------------------------------------------------------------
+# Data preparation
+# ----------------------------------------------------------------------------
+def prepare_df(df_raw, target, time_col):
+    """Replace inf, drop rows without a target, optionally sort chronologically."""
+    df = df_raw.replace([np.inf, -np.inf], np.nan)
+    if target is not None:
+        df = df.dropna(subset=[target])
+    if time_col is not None:
+        key = df[time_col]
+        if not pd.api.types.is_numeric_dtype(key):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                parsed = pd.to_datetime(key, errors="coerce")
+            if parsed.notna().mean() > 0.5:
+                key = parsed
+        df = df.assign(_sort_key=key).sort_values("_sort_key", kind="stable").drop(columns="_sort_key")
+    return df.reset_index(drop=True)
 
 
-def row_err(task, y, p):
-    if task == "regression":
-        return np.abs(np.asarray(y, float) - np.asarray(p, float))
-    return (np.asarray(y) != np.asarray(p)).astype(float)
-
-
-def ref_stats(task, e):
-    m, s = float(e.mean()), float(e.std())
-    s = max(s, 0.1) if task == "classification" else s
-    return m, max(s, 0.1 * m, 1e-9)
-
-
-# ------------------------------------------------------------------ metrics
-def evaluate(task, y, p, pos=None):
-    y, p = np.asarray(y), np.asarray(p)
-    if task == "regression":
-        e = np.abs(y.astype(float) - p.astype(float))
-        return dict(mae=float(e.mean()), rmse=float(np.sqrt((e ** 2).mean())))
-    labels = np.unique(np.concatenate([y, p]))
-    out = dict(err=float((y != p).mean()),
-               macro_f1=float(f1_score(y, p, labels=labels, average="macro", zero_division=0)),
-               precision=np.nan, recall=np.nan, f1=np.nan, n_pos=int((y == pos).sum()) if pos is not None else 0)
-    if pos is not None and pos in labels:
-        pr, rc, f1, _ = precision_recall_fscore_support(y, p, labels=[pos], average=None, zero_division=0)
-        out["precision"], out["f1"] = float(pr[0]), float(f1[0])
-        if out["n_pos"] > 0:
-            out["recall"] = float(rc[0])
-    return out
-
-
-def selection_score(metric, m):
-    if metric == "Error rate":
-        return m["err"]
-    if metric == "1 - macro F1":
-        return 1.0 - m["macro_f1"]
-    if metric.startswith("Fault-class miss rate"):
-        return 1.0 - m["recall"] if np.isfinite(m["recall"]) else np.nan
-    return m["mae"] if metric == "MAE" else m["rmse"]
-
-
-# ------------------------------------------------------------------ data prep
-@st.cache_data(show_spinner="Reading CSV...")
-def read(data):
-    for enc in ("utf-8-sig", "latin-1"):
-        try:
-            out = pd.read_csv(io.BytesIO(data), encoding=enc)
-            if out.shape[1] <= 1:
-                out = pd.read_csv(io.BytesIO(data), encoding=enc, sep=None, engine="python")
-            return out
-        except UnicodeDecodeError:
-            continue
-    raise ValueError("Could not read the file as CSV.")
-
-
-def label_str(s):
-    """Stable string labels: integral numbers become '0','1' (not '0.0','1.0'). Expects no missing values."""
-    s = pd.Series(s)
-    if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
-        v = s.to_numpy(float)
-        if len(v) and np.all(np.isfinite(v)) and np.all(np.mod(v, 1) == 0):
-            return v.astype(np.int64).astype(str)
-    return s.astype(str).to_numpy()
-
-
-def build_frame(df, num, cat):
-    parts = {}
-    for c in num:
-        v = np.array(pd.to_numeric(df[c], errors="coerce"), dtype=float)
-        v[~np.isfinite(v)] = np.nan
-        parts[c] = v
-    for c in cat:
-        parts[c] = np.where(df[c].notna(), df[c].astype(str), "(missing)")
-    return pd.DataFrame(parts, index=df.index)
-
-
-def pick_features(df, exclude):
-    num, cat = [], []
+def split_columns(df, target, time_col):
+    """Return numeric columns, categorical columns and a role table (with exclusion reasons)."""
+    num_cols, cat_cols, roles = [], [], []
     for c in df.columns:
-        if c in exclude:
-            continue
-        s, n = df[c], df[c].notna().sum()
-        if n == 0 or s.nunique() <= 1:
-            continue
-        if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
-            if not (s.nunique() / n > 0.99 and bool(np.all(np.mod(s.dropna(), 1) == 0))):  # skip id-like
-                num.append(c)
-        elif s.nunique() <= 50:
-            cat.append(c)
-    return num, cat
-
-
-# ------------------------------------------------------------------ session setup (UI independent)
-def init_session(df, target, tcol, task, cfg):
-    """Build the monitoring session dict. Raises ValueError with a readable message on bad input."""
-    if not RIVER_OK:
-        raise ValueError("The `river` package is not installed (pip install river).")
-    d = df.copy()
-    if tcol not in (None, "(row order)"):
-        tv = pd.to_numeric(d[tcol], errors="coerce") if pd.api.types.is_numeric_dtype(d[tcol]) \
-            else pd.to_datetime(d[tcol], errors="coerce", utc=True)
-        d = d.loc[tv.notna()].assign(_t=tv[tv.notna()]).sort_values("_t", kind="stable").drop(columns="_t")
-    d = d[d[target].notna()]
-    if task == "regression":
-        yv = pd.to_numeric(d[target], errors="coerce")
-        d = d.loc[np.isfinite(yv)]
-        y = yv[np.isfinite(yv)].to_numpy(float)
-    d = d.reset_index(drop=True)
-    if task == "classification":
-        y = label_str(d[target])
-    B = int(cfg["B"])
-    n_tr = int(len(d) * cfg["train_pct"] / 100)
-    n_fit = int(n_tr * 0.8)
-    if len(d) < 400:
-        raise ValueError("Need at least 400 labelled rows.")
-    if n_fit < 50 or len(d) - n_tr < 2 * B:
-        raise ValueError("Initial training part is too small, or the streaming part has fewer than 2 batches. "
-                         "Lower the batch size or adjust the training percentage.")
-    num, cat = pick_features(d.iloc[:n_tr], {target, tcol})   # chosen from the initial training rows only
-    if not (num or cat):
-        raise ValueError("No usable feature columns were found.")
-    X = build_frame(d, num, cat)
-    pos = cfg.get("pos")
-    if task == "classification" and pos is None:
-        vals, cnt = np.unique(y, return_counts=True)
-        pos = str(vals[np.argmin(cnt)])
-    hp = dict(grace=int(cfg["grace"]), delta=float(cfg["delta"]), tau=float(cfg["tau"]),
-              adwin=float(cfg["adwin"]), win_thr=int(cfg["win_thr"]))
-    S = dict(X=X, y=y, task=task, num=num, cat=cat, hp=hp, seed=int(cfg["seed"]), n_tr=n_tr, B=B,
-             N=len(y) - n_tr, nb=int(np.ceil((len(y) - n_tr) / B)), z=cfg["z"], delay=int(cfg["delay"]),
-             min_rows=int(cfg["min_rows"]), snooze=int(cfg["snooze"]), hold_frac=float(cfg["hold_frac"]),
-             metric=cfg.get("metric") or METRICS[task][0], pos=pos,
-             version=0, k=0, errs=[], thr=[], ver=[], bad=[], good=0, alert=None, snooze_until=0,
-             cand=None, events=[], retrains=[], flash=None)
-    try:
-        S["model"] = Bundle(task, num, cat, hp, S["seed"]).fit(X.iloc[:n_fit], y[:n_fit])
-    except Exception as exc:
-        raise ValueError(f"Could not train the first model: {exc}")
-    e = row_err(task, y[n_fit:n_tr], S["model"].predict(X.iloc[n_fit:n_tr]))
-    S["ref_m"], S["ref_s"] = ref_stats(task, e)
-    return S
-
-
-# ------------------------------------------------------------------ streaming engine
-def log(S, event, detail):
-    S["events"].append({"Batch": S["k"], "Event": event, "Detail": detail})
-
-
-def new_rows(S):
-    """Labelled rows available since the suspected drift start (respects label delay)."""
-    al = S["alert"]
-    if al is None:
-        return 0
-    known = S["k"] - S["delay"]
-    return max(0, min(known * S["B"], S["N"]) - al["start"] * S["B"])
-
-
-def step(S):
-    """Receive one batch: predict with the deployed model, then judge the batch whose labels just arrived."""
-    k, B, n_tr = S["k"], S["B"], S["n_tr"]
-    a, b = n_tr + k * B, min(n_tr + (k + 1) * B, len(S["y"]))
-    if b <= a:
-        S["k"] = S["nb"]
-        return
-    e = row_err(S["task"], S["y"][a:b], S["model"].predict(S["X"].iloc[a:b]))
-    S["errs"].append(float(e.mean()))
-    S["thr"].append(S["ref_m"] + S["z"] * S["ref_s"] / np.sqrt(b - a))
-    S["ver"].append(S["version"])
-    S["k"] = k + 1
-    j = k - S["delay"]                                   # batch whose labels arrive now
-    if j >= 0 and S["ver"][j] == S["version"]:           # only judge batches scored by the deployed model
-        flagged = S["errs"][j] > S["thr"][j]
-        if S["alert"] is None:
-            S["bad"] = S["bad"] + [j] if flagged else []
-            if len(S["bad"]) >= 2 and S["k"] > S["snooze_until"]:     # 2 bad batches in a row = alert
-                S["alert"], S["cand"], S["good"] = dict(start=S["bad"][0], status="waiting"), None, 0
-                S["bad"] = []
-                log(S, "Drift alert", f"errors above threshold since batch {S['alert']['start'] + 1}")
-        elif S["alert"]["status"] == "waiting":
-            S["good"] = 0 if flagged else S["good"] + 1
-            if S["good"] >= 3:                                         # it went away by itself
-                S["alert"] = None
-                log(S, "Alert cleared", "error returned to normal before retraining was needed")
-    al = S["alert"]
-    if al and al["status"] == "waiting" and new_rows(S) >= S["min_rows"]:
-        al["status"] = "ready"
-
-
-def ready(S):
-    return S["alert"] is not None and S["alert"]["status"] == "ready"
-
-
-def run(S, n):
-    i = 0
-    while S["k"] < S["nb"] and not ready(S) and (n is None or i < n):
-        step(S)
-        i += 1
-
-
-def get_data(S):
-    """(old X, old y, new X, new y): old = labelled rows before the drift start, new = labelled rows since."""
-    n_tr, B = S["n_tr"], S["B"]
-    s0 = n_tr + S["alert"]["start"] * B
-    s1 = max(s0, n_tr + min((S["k"] - S["delay"]) * B, S["N"]))
-    X, y = S["X"], S["y"]
-    return X.iloc[:s0], y[:s0], X.iloc[s0:s1], y[s0:s1]
-
-
-# ------------------------------------------------------------------ strategies: data selection -> training
-@dataclass
-class Plan:
-    kind: str                       # keep | continue
-    X: Optional[pd.DataFrame] = None
-    y: Optional[np.ndarray] = None
-    note: str = ""
-
-
-@dataclass
-class Strategy:
-    name: str
-    plan: Callable
-    blurb: str
-
-
-def plan_inc(S, Xo, yo, Xn, yn):
-    return Plan("continue", Xn, yn, note=f"copy of the deployed tree keeps learning from {len(yn):,} new rows; its "
-                                         "ADWIN detectors can replace outdated branches")
-
-
-def plan_keep(S, Xo, yo, Xn, yn):
-    return Plan("keep", note="deployed model unchanged")
-
-
-STRATEGIES = [
-    Strategy(INC, plan_inc, "Keep learning on a copy of the deployed tree using only the new rows, one row at a "
-                            "time. The tree's own drift detectors swap out branches that stopped working."),
-    Strategy(KEEP, plan_keep, "Leave the deployed model untouched."),
-]
-REG = {s.name: s for s in STRATEGIES}
-
-
-def execute(S, plan):
-    """Training procedure for a plan. Never mutates the deployed model (continue plans use a deep copy)."""
-    if plan.kind == "keep":
-        return S["model"]
-    if plan.kind == "continue":
-        return copy.deepcopy(S["model"]).learn(plan.X, plan.y)
-    raise ValueError(f"unknown plan kind {plan.kind}")
-
-
-def build(S, name, data):
-    plan = REG[name].plan(S, *data)
-    return execute(S, plan), plan.note
-
-
-# ------------------------------------------------------------------ candidate comparison and decisions
-def compute_cands(S):
-    """Train the candidate WITHOUT the newest labelled rows and score it against the current model on those rows."""
-    Xo, yo, Xn, yn = get_data(S)
-    n = len(yn)
-    if n < 2 * MIN_FIT:
-        return dict(error=f"Only {n} new labelled rows: not enough to hold out an evaluation set and still "
-                          f"train (need at least {2 * MIN_FIT}). Skip for now, or lower 'Min new labelled rows'.")
-    hold = int(np.clip(round(n * S["hold_frac"]), MIN_FIT, n - MIN_FIT))
-    Xh, yh, Xt, yt = Xn.iloc[-hold:], yn[-hold:], Xn.iloc[:-hold], yn[:-hold]
-    task, pos = S["task"], S["pos"]
-    mets, errs, preds, notes, failed = {}, {}, {}, {}, []
-    for sp in STRATEGIES:
-        try:
-            model, note = build(S, sp.name, (Xo, yo, Xt, yt))
-            p = model.predict(Xh)
-            if task == "regression" and not np.all(np.isfinite(np.asarray(p, float))):
-                raise ValueError("non-finite predictions")
-            mets[sp.name] = evaluate(task, yh, p, pos)
-            errs[sp.name], preds[sp.name], notes[sp.name] = row_err(task, yh, p), np.asarray(p), note
-        except Exception as exc:
-            failed.append((sp.name, f"{type(exc).__name__}: {exc}"))
-    if KEEP not in mets:
-        return dict(error="The current model could not be evaluated on the held-out rows.")
-    metric, warns = S["metric"], []
-    if metric.startswith("Fault-class") and not np.isfinite(mets[KEEP]["recall"]):
-        metric = "Error rate"
-        warns.append(f"The held-out rows contain no '{pos}' (fault) examples, so recall is undefined. "
-                     "Ranking uses error rate instead.")
-    rows = []
-    for sp in STRATEGIES:
-        if sp.name not in mets:
-            continue
-        m = mets[sp.name]
-        row = {"Strategy": sp.name, "Selection score": selection_score(metric, m)}
-        if task == "regression":
-            row.update({"MAE": m["mae"], "RMSE": m["rmse"]})
+        s = df[c]
+        if c == target:
+            roles.append((c, str(s.dtype), "target", ""))
+        elif c == time_col:
+            roles.append((c, str(s.dtype), "ordering column", "used for sorting only"))
+        elif pd.api.types.is_datetime64_any_dtype(s):
+            roles.append((c, str(s.dtype), "excluded", "datetime column"))
+        elif s.isna().all():
+            roles.append((c, str(s.dtype), "excluded", "all values missing"))
+        elif s.nunique(dropna=True) <= 1:
+            roles.append((c, str(s.dtype), "excluded", "constant column"))
+        elif (pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s)
+              and s.notna().all() and s.is_unique and (s.is_monotonic_increasing or s.is_monotonic_decreasing)):
+            roles.append((c, str(s.dtype), "excluded", "monotonic counter / index-like (use 'Order rows by' for time)"))
+        elif pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+            num_cols.append(c)
+            roles.append((c, str(s.dtype), "numeric feature", ""))
+        elif s.nunique(dropna=True) > MAX_CAT_UNIQUE:
+            roles.append((c, str(s.dtype), "excluded", f"more than {MAX_CAT_UNIQUE} categories (ID-like / free text)"))
         else:
-            row.update({"Error rate": m["err"], "Precision (fault class)": m["precision"],
-                        "Recall (fault class)": m["recall"], "F1 (fault class)": m["f1"], "Macro F1": m["macro_f1"]})
-        rows.append(row)
-    t = pd.DataFrame(rows)
-    keep = float(t.loc[t["Strategy"] == KEEP, "Selection score"].iloc[0])
-    t["Better than keeping (%)"] = (keep - t["Selection score"]) / keep * 100 if keep > 1e-12 else np.nan
-    valid = t[np.isfinite(t["Selection score"])].copy()
-    order = {sp.name: i for i, sp in enumerate(STRATEGIES)}
-    valid["_r"] = [(round(s, 12), 0 if nme == KEEP else 1 + order[nme]) for s, nme in
-                   zip(valid["Selection score"], valid["Strategy"])]
-    rec = valid.sort_values("_r").iloc[0]["Strategy"] if len(valid) else KEEP
-    # reliability notes
-    if hold < 100:
-        warns.append(f"Only {hold} held-out rows: differences between strategies may be noise.")
+            cat_cols.append(c)
+            roles.append((c, str(s.dtype), "categorical feature", ""))
+    return num_cols, cat_cols, pd.DataFrame(roles, columns=["column", "dtype", "role", "note"])
+
+
+def detect_task(y):
+    """Classification for text/bool targets and integer-valued targets with <= 10 values."""
+    y = y.dropna()
+    if not pd.api.types.is_numeric_dtype(y) or pd.api.types.is_bool_dtype(y):
+        return "classification"
+    if y.nunique() <= 10 and bool((y % 1 == 0).all()):
+        return "classification"
+    return "regression"
+
+
+def feature_frame(df, num_cols, cat_cols):
+    """Feature columns with categoricals as strings (missing stays NaN)."""
+    X = df[num_cols + cat_cols].copy()
+    for c in cat_cols:
+        col = X[c].astype(object)
+        X[c] = col.where(col.isna(), col.astype(str))
+    return X
+
+
+# ----------------------------------------------------------------------------
+# PSI (Population Stability Index)
+# ----------------------------------------------------------------------------
+def psi_spec(series, kind):
+    """Bin definition built from the REFERENCE data only (reused for every window)."""
+    if kind == "num":
+        vals = pd.to_numeric(series, errors="coerce").dropna().to_numpy(float)
+        if vals.size == 0:
+            return np.array([])
+        edges = np.unique(np.quantile(vals, np.linspace(0, 1, PSI_BINS + 1)))
+        return edges[1:-1]  # inner edges; first/last bins are open-ended
+    return series.dropna().astype(str).value_counts().head(MAX_CAT_LEVELS).index.tolist()
+
+
+def psi_counts(series, spec, kind):
+    """Counts per bin: [bins...] + [missing] for numeric; [categories...] + [unseen, missing] for categorical."""
+    if kind == "num":
+        s = pd.to_numeric(series, errors="coerce")
+        missing = int(s.isna().sum())
+        idx = np.searchsorted(spec, s.dropna().to_numpy(float), side="right")
+        counts = np.bincount(idx, minlength=len(spec) + 1)
+        return np.append(counts, missing).astype(float)
+    missing = int(series.isna().sum())
+    mapped = series.dropna().astype(str).map({c: i for i, c in enumerate(spec)})
+    counts = np.zeros(len(spec) + 2)
+    known = mapped.dropna().astype(int).to_numpy()
+    counts[: len(spec)] = np.bincount(known, minlength=len(spec))
+    counts[len(spec)] = int(mapped.isna().sum())  # unseen-category bucket
+    counts[len(spec) + 1] = missing
+    return counts
+
+
+def psi_value(ref_counts, cur_counts):
+    if ref_counts.sum() == 0 or cur_counts.sum() == 0:
+        return 0.0
+    p = np.maximum(ref_counts / ref_counts.sum(), PSI_EPS)
+    q = np.maximum(cur_counts / cur_counts.sum(), PSI_EPS)
+    return float(np.sum((q - p) * np.log(q / p)))
+
+
+# ----------------------------------------------------------------------------
+# Models and metrics
+# ----------------------------------------------------------------------------
+def make_model(task):
     if task == "classification":
-        npos = mets[KEEP]["n_pos"]
-        if npos < 10:
-            warns.append(f"Only {npos} '{pos}' (fault) rows in the held-out set: recall and F1 are unreliable.")
-        share = max(np.mean(yh == v) for v in np.unique(yh))
-        if share > 0.95 and metric == "Error rate":
-            warns.append(f"The held-out set is {share:.0%} one class; error rate can look good for a model that "
-                         "never predicts the fault class. Consider the fault-class miss rate in Advanced settings.")
-    if rec != KEEP and metric in ROW_WISE:
-        d = errs[KEEP] - errs[rec]
-        se = d.std(ddof=1) / np.sqrt(len(d)) if len(d) > 1 else 0.0
-        if d.mean() <= se:
-            warns.append(f"{rec} beats the current model by less than one standard error on these rows; "
-                         "treat the difference as a tie.")
-    k_s = float(t.loc[t["Strategy"] == KEEP, "Selection score"].iloc[0])
-    r_s = float(t.loc[t["Strategy"] == rec, "Selection score"].iloc[0])
-    if rec == KEEP:
-        why = (f"**Recommended: {KEEP}.** The candidate did not have a lower held-out {metric} "
-               f"({k_s:.4f}) than the current model.")
+        return SGDClassifier(loss="log_loss", alpha=1e-4, random_state=SEED)
+    return SGDRegressor(alpha=1e-4, random_state=SEED)
+
+
+def fit_epochs(model, X, y, task, classes, epochs=1, rng=None):
+    """Run `partial_fit` for a number of shuffled passes (works for fresh and trained models)."""
+    rng = rng if rng is not None else np.random.default_rng(SEED)
+    for _ in range(epochs):
+        order = rng.permutation(len(y))
+        if task == "classification":
+            model.partial_fit(X[order], y[order], classes=classes)
+        else:
+            model.partial_fit(X[order], y[order])
+
+
+def score(task, y_true, y_pred):
+    if task == "classification":
+        return {
+            "accuracy": accuracy_score(y_true, y_pred),
+            "f1": f1_score(y_true, y_pred, average="macro", zero_division=0),
+        }
+    return {
+        "mae": mean_absolute_error(y_true, y_pred),
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+    }
+
+
+def reservoir_add(Xb, yb, filled, seen, Xn, yn, rng):
+    """Bounded replay buffer: reservoir sampling keeps a uniform sample of everything seen."""
+    cap = len(yb)
+    for i in range(len(yn)):
+        seen += 1
+        if filled < cap:
+            Xb[filled], yb[filled] = Xn[i], yn[i]
+            filled += 1
+        else:
+            j = int(rng.integers(0, seen))
+            if j < cap:
+                Xb[j], yb[j] = Xn[i], yn[i]
+    return filled, seen
+
+
+def make_windows(n_ref, n, batch):
+    """Consecutive (start, end) windows; a short last chunk is merged into the previous window."""
+    bounds = list(range(n_ref, n, batch))
+    windows = [(s, min(s + batch, n)) for s in bounds]
+    if len(windows) > 1 and windows[-1][1] - windows[-1][0] < batch // 2:
+        last = windows.pop()
+        windows[-1] = (windows[-1][0], last[1])
+    return windows
+
+
+def recovery_text(scores, first_w, higher_better, tol=0.05):
+    """Windows between the first degraded window after the drift signal and recovery (within 5% of pre-drift level)."""
+    if first_w is None:
+        return "n/a (no drift signal)"
+    if first_w == 0:
+        return "n/a (no pre-drift windows)"
+    scores = np.asarray(scores, float)
+    pre = scores[:first_w].mean()
+    ok = scores >= pre * (1 - tol) if higher_better else scores <= pre * (1 + tol)
+    after = ok[first_w:]
+    bad = np.where(~after)[0]
+    if len(bad) == 0:
+        return "0 (no degradation)"
+    rest = np.where(after[bad[0]:])[0]
+    if len(rest) == 0:
+        return "not recovered"
+    return f"{int(rest[0])} windows"
+
+
+# ----------------------------------------------------------------------------
+# The experiment
+# ----------------------------------------------------------------------------
+def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
+    n = len(df)
+    n_ref = int(n * cfg["ref_pct"] / 100)
+    if n_ref < 50:
+        raise ValueError("The reference period has fewer than 50 rows. Increase the reference percentage.")
+    windows = make_windows(n_ref, n, cfg["batch"])
+    if len(windows) < 3:
+        raise ValueError("Fewer than 3 evaluation windows. Reduce the window size or the reference percentage.")
+    labelled = target is not None
+    method = cfg["method"]
+    if method == "ADWIN" and not labelled:
+        raise ValueError("ADWIN monitors prediction errors, which need a target column. Select a target or use PSI.")
+    use_adwin = method in ("ADWIN", "Both") and labelled
+    use_psi = method in ("PSI", "Both")
+    always = cfg["trigger"] == "Every window"
+    X_df = feature_frame(df, num_cols, cat_cols)
+    rng = np.random.default_rng(SEED)
+
+    # --- PSI reference bins (reference period only) ---
+    specs = {}
+    if use_psi:
+        ref_df = X_df.iloc[:n_ref]
+        for c in num_cols + cat_cols:
+            kind = "num" if c in num_cols else "cat"
+            spec = psi_spec(ref_df[c], kind)
+            specs[c] = (kind, spec, psi_counts(ref_df[c], spec, kind))
+
+    # --- model setup (preprocessing is fitted on the reference period only) ---
+    models, base, classes = {}, None, None
+    if labelled:
+        steps = []
+        if num_cols:
+            steps.append(("num", Pipeline([("imp", SimpleImputer(strategy="median", keep_empty_features=True)),
+                                           ("sc", StandardScaler())]), num_cols))
+        if cat_cols:
+            steps.append(("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),
+                                           ("oh", OneHotEncoder(handle_unknown="ignore", sparse_output=False))]), cat_cols))
+        pre = ColumnTransformer(steps).fit(X_df.iloc[:n_ref])
+        X_all = np.asarray(pre.transform(X_df), dtype=float)
+        if task == "classification":
+            le = LabelEncoder().fit(df[target].astype(str))  # only the label vocabulary comes from all rows
+            y_all = le.transform(df[target].astype(str))
+            classes = np.arange(len(le.classes_))
+            y_true_all = y_all
+            mu, sd = 0.0, 1.0
+            if len(np.unique(y_all[:n_ref])) < 2:
+                raise ValueError("The reference period contains a single class. Increase the reference percentage.")
+        else:
+            y_raw = df[target].astype(float).to_numpy()
+            mu = float(y_raw[:n_ref].mean())
+            sd = float(y_raw[:n_ref].std()) or 1.0
+            y_all = (y_raw - mu) / sd  # target scaling uses reference statistics only
+            y_true_all = y_raw
+        base = make_model(task)
+        fit_epochs(base, X_all[:n_ref], y_all[:n_ref], task, classes, epochs=10, rng=rng)
+        models[STATIC] = base
+        for name in cfg["strategies"]:
+            models[name] = copy.deepcopy(base)
+        if TRANS in cfg["strategies"]:
+            models[SCRATCH] = None  # fitted at the first adaptation; until then the source model predicts
+
+        d = X_all.shape[1]
+        cap = cfg["buffer"]
+        Xb, yb = np.zeros((cap, d)), np.zeros(cap, dtype=y_all.dtype)
+        filled = seen = 0
+        if CONT in models:
+            filled, seen = reservoir_add(Xb, yb, filled, seen, X_all[:n_ref], y_all[:n_ref], rng)
+        Xt, yt = np.zeros((0, d)), np.zeros(0, dtype=y_all.dtype)
+
+    def predict(name, X):
+        m = models[name]
+        return (base if m is None else m).predict(X)
+
+    def to_orig(p):
+        return p if task == "classification" else p * sd + mu
+
+    # --- state ---
+    adwin = ADWIN(delta=cfg["adwin_delta"]) if use_adwin else None
+    adwin_events, psi_cols, flagged_windows, active_windows = [], [], [], []
+    metric_rows, preds_store = [], {name: [] for name in models}
+    upd_time = {name: 0.0 for name in models}
+    upd_count = {name: 0 for name in models}
+    remaining = 0
+
+    for w, (s, e) in enumerate(windows):
+        progress((w + 1) / len(windows), f"Window {w + 1} / {len(windows)}")
+        active = labelled and (always or remaining > 0)
+        if active:
+            active_windows.append(w)
+
+        # 1) PREDICT with every model before anything is trained on this window
+        raw = {}
+        if labelled:
+            Xw, yw = X_all[s:e], y_all[s:e]
+            for name in models:
+                if name == ONLINE and active:
+                    # true prequential: predict row i, then learn row i
+                    out, t_up = [], 0.0
+                    for i in range(len(yw)):
+                        xi = Xw[i:i + 1]
+                        out.append(models[ONLINE].predict(xi)[0])
+                        t0 = time.perf_counter()
+                        fit_epochs(models[ONLINE], xi, yw[i:i + 1], task, classes, rng=rng)
+                        t_up += time.perf_counter() - t0
+                    raw[name] = np.array(out)
+                    upd_time[ONLINE] += t_up
+                    upd_count[ONLINE] += len(yw)
+                else:
+                    raw[name] = predict(name, Xw)
+            for name, p in raw.items():
+                preds_store[name].append(p)
+                metric_rows.append({"strategy": name, "window": w, "start": s, "end": e,
+                                    **score(task, y_true_all[s:e], to_orig(p))})
+
+        # 2) DETECT (labels of this window have now "arrived")
+        flag_adwin = flag_psi = False
+        if use_adwin:
+            if task == "classification":
+                errors = (raw[STATIC] != yw).astype(float)
+            else:
+                errors = np.clip(np.abs(raw[STATIC] - yw), 0, 5)  # standardised absolute error, clipped for stability
+            for i, err in enumerate(errors):  # errors of the NEVER-updated model: independent of adaptation
+                adwin.update(float(err))
+                if adwin.drift_detected:
+                    adwin_events.append({"row": s + i, "window": w})
+                    flag_adwin = True
+        if use_psi:
+            col = {}
+            for c, (kind, spec, ref_counts) in specs.items():
+                col[c] = psi_value(ref_counts, psi_counts(X_df[c].iloc[s:e], spec, kind))
+            psi_cols.append(col)
+            flag_psi = max(col.values()) >= cfg["psi_thr"]
+        if flag_adwin or flag_psi:
+            flagged_windows.append(w)
+
+        # 3) ADAPT (labels are available now; only models that are allowed to adapt are updated)
+        if labelled:
+            if CONT in models:
+                if active and filled > 0:
+                    k = min(len(yw), filled)
+                    idx = rng.choice(filled, size=k, replace=False)
+                    t0 = time.perf_counter()
+                    fit_epochs(models[CONT], np.vstack([Xw, Xb[idx]]), np.concatenate([yw, yb[idx]]),
+                               task, classes, rng=rng)
+                    upd_time[CONT] += time.perf_counter() - t0
+                    upd_count[CONT] += 1
+                filled, seen = reservoir_add(Xb, yb, filled, seen, Xw, yw, rng)
+            if INCR in models and active:
+                t0 = time.perf_counter()
+                fit_epochs(models[INCR], Xw, yw, task, classes, rng=rng)
+                upd_time[INCR] += time.perf_counter() - t0
+                upd_count[INCR] += 1
+            if TRANS in models:
+                Xt, yt = np.vstack([Xt, Xw])[-TARGET_CAP:], np.concatenate([yt, yw])[-TARGET_CAP:]
+                if active:
+                    t0 = time.perf_counter()
+                    tm = copy.deepcopy(base)  # start from the frozen source model
+                    fit_epochs(tm, Xt, yt, task, classes, epochs=TRANSFER_EPOCHS, rng=rng)
+                    upd_time[TRANS] += time.perf_counter() - t0
+                    models[TRANS] = tm
+                    upd_count[TRANS] += 1
+                    t0 = time.perf_counter()
+                    sm = make_model(task)  # same data and budget, random start
+                    fit_epochs(sm, Xt, yt, task, classes, epochs=TRANSFER_EPOCHS, rng=rng)
+                    upd_time[SCRATCH] += time.perf_counter() - t0
+                    models[SCRATCH] = sm
+                    upd_count[SCRATCH] += 1
+
+        # 4) update the adaptation switch for the NEXT windows
+        if active and not always:
+            remaining -= 1
+        if flag_adwin or flag_psi:
+            remaining = cfg["adapt_windows"]
+
+    # --- summaries ---
+    res = {"cfg": cfg, "task": task, "labelled": labelled, "n_ref": n_ref, "windows": windows,
+           "use_adwin": use_adwin, "use_psi": use_psi, "adwin_events": adwin_events,
+           "flagged_windows": flagged_windows, "active_windows": active_windows,
+           "metrics": pd.DataFrame(metric_rows)}
+    first_w = flagged_windows[0] if flagged_windows else None
+    res["first_flag_window"] = first_w
+
+    if use_psi:
+        psi_df = pd.DataFrame(psi_cols).T
+        psi_df.columns = list(range(len(windows)))
+        thr = cfg["psi_thr"]
+        mod_cut = min(0.10, thr)
+        rows = []
+        stream = X_df.iloc[n_ref:windows[-1][1]]
+        for c, (kind, spec, ref_counts) in specs.items():
+            vals = psi_df.loc[c].to_numpy(float)
+            whole = psi_value(ref_counts, psi_counts(stream[c], spec, kind))
+            flagged = np.where(vals >= thr)[0]
+            mx = float(vals.max())
+            status = "Significant shift" if mx >= thr else ("Moderate shift" if mx >= mod_cut else "Stable")
+            rows.append({"feature": c, "type": "numeric" if kind == "num" else "categorical",
+                         "max window PSI": mx, "whole-stream PSI": whole,
+                         "windows over threshold": int(len(flagged)),
+                         "first window over threshold (start row)": windows[flagged[0]][0] if len(flagged) else None,
+                         "status": status})
+        res["psi_df"] = psi_df
+        res["psi_table"] = pd.DataFrame(rows).sort_values("max window PSI", ascending=False).reset_index(drop=True)
+        res["psi_flag_windows"] = [w for w in range(len(windows)) if psi_df[w].max() >= thr]
     else:
-        why = (f"**Recommended: {rec}.** It had the lowest held-out {metric} ({r_s:.4f} vs {k_s:.4f} for the current "
-               f"model) among candidates that ran successfully.")
-    why += f" This is a measurement on {hold:,} recent labelled rows, not a guarantee for future data."
-    return dict(table=t, errs=errs, preds=preds, yh=yh, notes=notes, hold=hold, n_old=len(yo), n_new=n,
-                n_train=len(yt), failed=failed, metric=metric, warnings=warns, rec=rec, why=why)
+        res["psi_flag_windows"] = []
+
+    # detection delay if a drift onset is known
+    onset = cfg["onset"]
+    delays = None
+    if onset > 0:
+        a_rows = [ev["row"] for ev in adwin_events]
+        after = [r for r in a_rows if r >= onset]
+        p_after = [windows[w][1] for w in res["psi_flag_windows"] if windows[w][1] > onset]
+        delays = {
+            "ADWIN delay (rows)": (after[0] - onset) if after else None,
+            "ADWIN false alarms before onset": sum(r < onset for r in a_rows),
+            "PSI delay (rows)": max(0, p_after[0] - onset) if p_after else None,
+            "PSI false-alarm windows before onset": sum(windows[w][1] <= onset for w in res["psi_flag_windows"]),
+        }
+    res["delays"] = delays
+
+    if labelled:
+        higher = task == "classification"
+        prim = "f1" if higher else "mae"
+        res["primary"], res["higher_better"] = prim, higher
+        stream_end = windows[-1][1]
+        y_stream_true = y_true_all[n_ref:stream_end]
+        post_mask = None
+        if first_w is not None:
+            post_mask = np.arange(n_ref, stream_end) >= windows[first_w][1]
+            if post_mask.sum() == 0:
+                post_mask = None
+        mdf = res["metrics"]
+        rows, rank = [], {}
+        for name in models:
+            p = to_orig(np.concatenate(preds_store[name]))
+            overall = score(task, y_stream_true, p)
+            post = score(task, y_stream_true[post_mask], p[post_mask]) if post_mask is not None else None
+            series = mdf[mdf.strategy == name].sort_values("window")[prim].to_numpy()
+            row = {"Strategy": name}
+            if task == "classification":
+                row.update({"Accuracy": overall["accuracy"], "F1 (macro)": overall["f1"],
+                            "Post-drift F1": post["f1"] if post else np.nan})
+            else:
+                row.update({"MAE": overall["mae"], "RMSE": overall["rmse"],
+                            "Post-drift MAE": post["mae"] if post else np.nan})
+            row.update({"Recovery": recovery_text(series, first_w, higher),
+                        "Updates": upd_count[name],
+                        "Update time (s)": upd_time[name]})
+            rows.append(row)
+            rank[name] = (post[prim] if post else overall[prim])
+        res["summary"], res["rank_basis"] = pd.DataFrame(rows), rank
+        res["rank_uses_post_drift"] = post_mask is not None
+        cands = [s_ for s_ in cfg["strategies"] if s_ in rank]
+        if cands:
+            res["best"] = max(cands, key=lambda k: rank[k]) if higher else min(cands, key=lambda k: rank[k])
+    return res
 
 
-def apply_choice(S, name):
-    """Apply a decision. Returns (ok, message). The deployed model and version change only on success."""
-    c, al = S["cand"], S["alert"]
-    if name == KEEP:
-        S["snooze_until"] = S["k"] + S["snooze"]
-        log(S, "Kept current model", f"no alerts for {S['snooze']} batches")
-        msg = f"Kept the current model (v{S['version']}). No new alerts for {S['snooze']} batches."
-    else:
-        try:
-            if name not in c["errs"]:
-                raise ValueError("this strategy has no valid evaluation")
-            Xo, yo, Xn, yn = get_data(S)
-            model, note = build(S, name, (Xo, yo, Xn, yn))     # final build on ALL new labelled rows
-            model.predict(Xn.iloc[:1])                          # smoke test before accepting
-        except Exception as exc:
-            log(S, "Retraining failed", f"{name}: {exc}. Deployed model unchanged.")
-            return False, f"Retraining with {name} failed: {exc}. The deployed model was not changed."
-        S["model"] = model
-        S["version"] += 1
-        S["ref_m"], S["ref_s"] = ref_stats(S["task"], c["errs"][name])   # threshold from honest held-out errors
-        t = c["table"].set_index("Strategy")["Selection score"]
-        S["retrains"].append(dict(version=S["version"], strategy=name, applied=S["k"], start=al["start"],
-                                  score_new=float(t[name]), score_keep=float(t[KEEP]), metric=c["metric"]))
-        log(S, "Retrained", f"v{S['version']} = {name} (old {c['n_old']:,} rows, new {c['n_new']:,} rows)")
-        msg = f"Deployed model v{S['version']} ({name})."
-    S["alert"], S["cand"], S["bad"], S["good"] = None, None, [], 0
-    return True, msg
-
-
-# ------------------------------------------------------------------ UI helpers
-_NEW_API = tuple(int(x) for x in st.__version__.split(".")[:2] if x.isdigit()) >= (1, 50)
-
-
-def wide(fn, *a, **kw):
-    kw["width" if _NEW_API else "use_container_width"] = "stretch" if _NEW_API else True
-    return fn(*a, **kw)
-
-
-def confirm_box(flag, message, yes_label):
-    if not st.session_state.get(flag):
-        return False
-    st.warning(message)
-    a, b = st.columns(2)
-    if a.button(yes_label, key=flag + "_yes", type="primary"):
-        st.session_state[flag] = False
-        return True
-    if b.button("Cancel", key=flag + "_no"):
-        st.session_state[flag] = False
-        st.rerun()
-    return False
-
-
-def drift_chart(S):
-    n = min(S["k"], len(S["ver"]), len(S["errs"]), len(S["thr"]))
-    xs, ver = np.arange(1, n + 1), np.asarray(S["ver"])[:n]
-    errs, thr = np.asarray(S["errs"], float)[:n], np.asarray(S["thr"], float)[:n]
-    reg = S["task"] == "regression"
+# ----------------------------------------------------------------------------
+# Plot helpers
+# ----------------------------------------------------------------------------
+def timeline_fig(res):
+    windows = res["windows"]
+    mid = [(s + e) / 2 for s, e in windows]
     fig = go.Figure()
-    for i, v in enumerate(sorted(np.unique(ver))):
-        idx = np.flatnonzero(ver == v)
-        fig.add_trace(go.Scatter(x=xs[idx], y=errs[idx], mode="lines+markers", name=f"Model v{v}",
-                                 line=dict(color=PALETTE[i % len(PALETTE)])))
-    fig.add_trace(go.Scatter(x=xs, y=thr, mode="lines", name="Drift threshold", line=dict(dash="dash", color="#c62828")))
-    for r in S["retrains"]:
-        if 1 <= r["applied"] + 1 <= n:
-            fig.add_vline(x=r["applied"] + 1, line_color="#2e7d32", annotation_text=f"Retrain v{r['version']}",
-                          annotation_position="top left")
-        if 1 <= r["start"] + 1 <= n:
-            fig.add_vline(x=r["start"] + 1, line_color="#c62828", line_dash="dot", opacity=0.5)
-    if S["alert"] is not None and 1 <= S["alert"]["start"] + 1 <= n:
-        fig.add_vline(x=S["alert"]["start"] + 1, line_color="#c62828", annotation_text="Drift starts",
-                      annotation_position="top right")
-    fig.update_layout(title="Prediction error per incoming batch", xaxis_title="Batch",
-                      yaxis_title="MAE (target units)" if reg else "Error rate (share of wrong predictions)",
-                      height=360, margin=dict(t=50, b=40, l=50, r=20), legend=dict(orientation="h", y=-0.2))
-    wide(st.plotly_chart, fig)
-
-
-def confusion_fig(y, p):
-    labels = list(np.unique(np.concatenate([y, p])))
-    cm = confusion_matrix(y, p, labels=labels)
-    fig = go.Figure(go.Heatmap(z=cm, x=[f"pred {l}" for l in labels], y=[f"true {l}" for l in labels], text=cm,
-                               texttemplate="%{text}", colorscale="Blues", showscale=False))
-    fig.update_yaxes(autorange="reversed")
-    fig.update_layout(height=280, margin=dict(t=20, b=20, l=20, r=20))
+    if res["labelled"]:
+        prim = res["primary"]
+        sdf = res["metrics"][res["metrics"].strategy == STATIC].sort_values("window")
+        y = sdf[prim].to_numpy()
+        ylabel = "F1 (macro)" if prim == "f1" else "MAE"
+        fig.add_trace(go.Scatter(x=mid, y=y, mode="lines+markers", name=f"Static model {ylabel}"))
+    else:
+        y = res["psi_df"].max().to_numpy()
+        ylabel = "max feature PSI"
+        fig.add_trace(go.Scatter(x=mid, y=y, mode="lines+markers", name="Max feature PSI per window"))
+    lo, hi = float(np.min(y)), float(np.max(y))
+    pad = (hi - lo) * 0.12 or 0.05
+    if res["adwin_events"]:
+        fig.add_trace(go.Scatter(x=[ev["row"] for ev in res["adwin_events"]], y=[lo - pad] * len(res["adwin_events"]),
+                                 mode="markers", name="ADWIN drift event",
+                                 marker=dict(symbol="triangle-up", color="red", size=10)))
+    if res["psi_flag_windows"]:
+        fig.add_trace(go.Scatter(x=[mid[w] for w in res["psi_flag_windows"]], y=[hi + pad] * len(res["psi_flag_windows"]),
+                                 mode="markers", name="PSI drift window",
+                                 marker=dict(symbol="square", color="orange", size=10)))
+    fig.add_vline(x=res["n_ref"], line_dash="dot", line_color="gray", annotation_text="end of reference")
+    if res["cfg"]["onset"] > 0:
+        fig.add_vline(x=res["cfg"]["onset"], line_dash="dash", line_color="green", annotation_text="known onset")
+    fig.update_layout(xaxis_title="Row index", yaxis_title=ylabel, height=420, margin=dict(t=30),
+                      legend=dict(orientation="h", y=-0.2))
     return fig
 
 
-def decision_panel(S):
-    c, al = S["cand"], S["alert"]
-    with st.container(border=True):
-        st.subheader("Drift confirmed: choose how to adapt")
-        if c.get("error"):
-            st.error(c["error"])
-            if st.button("Skip retraining (keep current model)", key="skip_err"):
-                S["snooze_until"] = S["k"] + S["snooze"]
-                log(S, "Kept current model", "not enough data to evaluate candidates")
-                S["alert"], S["cand"], S["bad"], S["good"] = None, None, [], 0
-                S["flash"] = ("info", "Kept the current model.")
-                st.rerun()
-            return
-        m = st.columns(4)
-        m[0].metric("Drift started at batch", al["start"] + 1)
-        m[1].metric("Historical labelled rows", f"{c['n_old']:,}")
-        m[2].metric("New labelled rows", f"{c['n_new']:,}", help=f"{c['n_train']:,} used for training candidates, "
-                    f"{c['hold']:,} held out")
-        m[3].metric("Held-out evaluation rows", f"{c['hold']:,}")
-        t = c["table"]
-        ts = t.sort_values("Selection score").reset_index(drop=True)
-        cols = ["#9e9e9e" if s == KEEP else "#2e7d32" if s == c["rec"] else "#1f6fb2" for s in ts["Strategy"]]
-        fig = go.Figure(go.Bar(x=ts["Selection score"], y=ts["Strategy"], orientation="h", marker_color=cols,
-                               text=ts["Selection score"].round(4), textposition="auto"))
-        fig.update_layout(title=f"Held-out {c['metric']} per candidate (lower is better)", height=60 + 38 * len(ts),
-                          yaxis=dict(autorange="reversed"), margin=dict(t=45, b=30, l=10, r=10),
-                          xaxis_title=c["metric"])
-        wide(st.plotly_chart, fig)
-        st.markdown(c["why"])
-        for w in c["warnings"]:
-            st.warning(w)
-        score = dict(zip(t["Strategy"], t["Selection score"]))
-        opts = [s.name for s in STRATEGIES if s.name in score and np.isfinite(score[s.name])]
-        k = S["k"]
-        choice = st.radio("Strategy (held-out score in brackets)", opts, index=opts.index(c["rec"]),
-                          format_func=lambda n: f"{n}  ({score[n]:.4f})", key=f"pick_{k}")
-        st.caption(f"{REG[choice].blurb}  \nHow it will be built: {c['notes'][choice]}.")
-        a1, a2, _ = st.columns([1.2, 1.6, 3])
-        if a1.button("Apply", type="primary", disabled=choice == KEEP, key=f"apply_{k}",
-                     help="Keep Current Model is confirmed with the Skip button." if choice == KEEP else None):
-            ok, msg = apply_choice(S, choice)
-            S["flash"] = ("success" if ok else "error", msg)
-            st.rerun()
-        if a2.button("Skip retraining (keep current model)", key=f"skip_{k}"):
-            ok, msg = apply_choice(S, KEEP)
-            S["flash"] = ("info", msg)
-            st.rerun()
-        if c["failed"]:
-            st.caption("Failed to build, excluded from the ranking: " + "; ".join(f"{n} ({why})" for n, why in c["failed"]))
-        with st.expander("Detailed held-out metrics and confusion matrix"):
-            wide(st.dataframe, t.round(4), hide_index=True)
-            if S["task"] == "classification":
-                st.caption(f"Fault class = '{S['pos']}'. Precision/recall/F1 are for that class.")
-                st.write(f"Confusion matrix: {choice}")
-                wide(st.plotly_chart, confusion_fig(c["yh"], c["preds"][choice]))
+# ----------------------------------------------------------------------------
+# Load data
+# ----------------------------------------------------------------------------
+st.title("Model Drift Detection Dashboard")
+st.sidebar.header("Configuration")
 
+uploaded_file = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
 
-def retrain_results(S):
-    st.subheader("How is each retrained model performing now?")
-    ver, errs = np.asarray(S["ver"]), np.asarray(S["errs"], float)
-    unit = "MAE" if S["task"] == "regression" else "error rate"
-    rows = []
-    for r in S["retrains"]:
-        idx = np.arange(r["start"], min(r["applied"], len(errs)))
-        before = errs[idx][ver[idx] == r["version"] - 1] if len(idx) else np.array([])
-        after = errs[ver == r["version"]]
-        b, a = (before.mean() if len(before) else np.nan), (after.mean() if len(after) else np.nan)
-        rows.append({"Version": f"v{r['version']}", "Strategy": r["strategy"], "Applied at batch": r["applied"] + 1,
-                     f"Held-out {r['metric']} at decision": r["score_new"],
-                     "Held-out score of old model": r["score_keep"],
-                     f"Live {unit}: old model since drift": b, f"Live {unit}: this model": a,
-                     "Batches measured": int(len(after)),
-                     "Live change (%)": (b - a) / b * 100 if np.isfinite(b) and b > 1e-12 and np.isfinite(a) else np.nan})
-    wide(st.dataframe, pd.DataFrame(rows).round(4), hide_index=True)
-    st.caption("Held-out columns use the decision's selection metric; live columns use the monitoring metric "
-               f"({unit}). Early live numbers cover few batches, so read them with care.")
+try:
+    if uploaded_file is not None:
+        df_raw = pd.read_csv(uploaded_file)
+        source_name = uploaded_file.name
+    elif os.path.exists(DEFAULT_CSV_PATH):
+        df_raw = pd.read_csv(DEFAULT_CSV_PATH)
+        source_name = DEFAULT_CSV_PATH
+    else:
+        st.warning("Upload a CSV file or add data.csv to the project.")
+        st.stop()
+except Exception as exc:  # unreadable / malformed file
+    st.error(f"Could not read the CSV file: {exc}")
+    st.stop()
 
+if df_raw.shape[0] < 100 or df_raw.shape[1] < 2:
+    st.error("The CSV needs at least 100 rows and 2 columns.")
+    st.stop()
+df_raw.columns = [str(c) for c in df_raw.columns]
 
-# ------------------------------------------------------------------ app
-CSS = """<style>
-.block-container{padding-top:1.4rem;padding-bottom:1.5rem}
-[data-testid="stMetric"]{background:rgba(128,128,128,.08);border-radius:8px;padding:.45rem .8rem}
-</style>"""
+# ----------------------------------------------------------------------------
+# Sidebar
+# ----------------------------------------------------------------------------
+NONE_LABEL = "(none - PSI only)"
+cols = list(df_raw.columns)
+target_choice = st.sidebar.selectbox("Target column", [NONE_LABEL] + cols, index=len(cols))
+target = None if target_choice == NONE_LABEL else target_choice
+order_choice = st.sidebar.selectbox("Order rows by (optional)", ["(keep file order)"] + cols,
+                                    help="Drift analysis is chronological. Pick a timestamp column if the file is not already in time order.")
+time_col = None if order_choice == "(keep file order)" else order_choice
+task_choice = st.sidebar.radio("Task type", ["Auto", "Classification", "Regression"], horizontal=True)
+ref_pct = st.sidebar.slider("Reference data (% of rows)", 10, 70, 30)
+method = st.sidebar.radio("Drift detection method", ["ADWIN", "PSI", "Both"], index=2, horizontal=True)
+strategies = st.sidebar.multiselect("Learning strategies", LEARNERS, default=LEARNERS)
+batch = st.sidebar.slider("Window / batch size (rows)", 20, 2000, 200, step=10,
+                          help="PSI is noisy on very small windows; 200 or more is recommended.")
+psi_thr = st.sidebar.number_input("PSI threshold", min_value=0.01, max_value=2.0, value=0.2, step=0.05)
+adwin_delta = st.sidebar.number_input("ADWIN delta", min_value=0.000001, max_value=0.5, value=0.002,
+                                      step=0.001, format="%.4f")
+trigger = st.sidebar.radio("Adapt models", ["On drift signal", "Every window"], horizontal=True,
+                           help="'On drift signal': after a detector fires, models adapt for the next k windows.")
+adapt_windows = st.sidebar.slider("Windows to adapt after a drift signal (k)", 1, 10, 3,
+                                  disabled=(trigger == "Every window"))
+buffer_size = st.sidebar.slider("Continual replay buffer size", 100, 5000, 500, step=100)
+onset = st.sidebar.number_input("Known drift onset row (0 = unknown)", min_value=0, max_value=int(len(df_raw)),
+                                value=0, step=100, help="Optional. Enables detection-delay and false-alarm counts.")
+run_clicked = st.sidebar.button("Run Analysis", type="primary", use_container_width=True)
 
+# ----------------------------------------------------------------------------
+# Dataset preparation
+# ----------------------------------------------------------------------------
+df = prepare_df(df_raw, target, time_col)
+num_cols, cat_cols, roles = split_columns(df, target, time_col)
+if len(num_cols) + len(cat_cols) == 0:
+    st.error("No usable feature columns were found after excluding the target and invalid columns.")
+    st.stop()
 
-def sidebar_config(S):
-    with st.sidebar:
-        st.header("Configuration")
-        up = st.file_uploader("Upload a CSV (rows in time order, or pick a time column)", type=["csv"])
-        if up is None:
-            return
+task = None
+if target is not None:
+    task = detect_task(df[target]) if task_choice == "Auto" else task_choice.lower()
+    if task == "regression" and not pd.api.types.is_numeric_dtype(df[target]):
+        st.error("Regression needs a numeric target column.")
+        st.stop()
+    if task == "classification" and df[target].nunique() > 50:
+        st.error("The target has more than 50 distinct values. Choose Regression or a different target.")
+        st.stop()
+
+# ----------------------------------------------------------------------------
+# Run
+# ----------------------------------------------------------------------------
+cfg = {"ref_pct": ref_pct, "method": method, "strategies": strategies, "batch": batch, "psi_thr": float(psi_thr),
+       "adwin_delta": float(adwin_delta), "trigger": trigger, "adapt_windows": adapt_windows,
+       "buffer": buffer_size, "onset": int(onset)}
+cfg_key = repr((source_name, target, time_col, task, sorted(cfg.items(), key=lambda kv: kv[0])))
+
+if run_clicked:
+    if target is not None and not strategies:
+        st.sidebar.error("Select at least one learning strategy.")
+    else:
+        bar = st.progress(0.0, text="Starting...")
         try:
-            df = read(up.getvalue())
-        except Exception as exc:
+            with st.spinner("Running drift detection and learning strategies..."):
+                st.session_state["result"] = run_experiment(
+                    df, num_cols, cat_cols, target, task, cfg, lambda f, t: bar.progress(f, text=t))
+            st.session_state["result_key"] = cfg_key
+        except ValueError as exc:
+            st.session_state.pop("result", None)
             st.error(str(exc))
-            return
-        target = st.selectbox("Target column", df.columns, index=len(df.columns) - 1)
-        tcol = st.selectbox("Time column (optional)", ["(row order)"] + [c for c in df.columns if c != target])
-        st.caption("Model: Hoeffding Adaptive Tree (river), learns one row at a time and adapts to drift internally.")
-        guess = "regression" if (pd.api.types.is_numeric_dtype(df[target]) and df[target].nunique() > 10) else "classification"
-        task = st.radio("Task", ["classification", "regression"], index=["classification", "regression"].index(guess),
-                        horizontal=True)
-        train_pct = st.slider("Initial training %", 20, 70, 40, 5)
-        B = int(st.number_input("Batch size (rows)", 20, 5000, 100))
-        sens = st.selectbox("Drift sensitivity", list(SENS), index=1)
-        delay = int(st.number_input("Label delay (batches)", 0, 20, 0))
-        min_rows = int(st.number_input("Min new labelled rows before asking", 100, 100000, 300,
-                                       help="After a drift alert, monitoring continues until this many post-drift "
-                                            "labelled rows exist."))
-        snooze = int(st.number_input("Snooze after 'keep' (batches)", 0, 200, 10))
-        with st.expander("Advanced settings"):
-            hold_frac = st.slider("Share of new labelled rows held out for evaluation", 0.10, 0.40, 0.25, 0.05)
-            metric = st.selectbox("Selection metric (lower is better)", METRICS[task])
-            pos = None
-            if task == "classification":
-                tgt = df[target].dropna()
-                labs = sorted(set(label_str(tgt)))[:50]
-                vc = pd.Series(label_str(tgt)).value_counts()
-                dflt = "1" if "1" in labs else (str(vc.index[-1]) if str(vc.index[-1]) in labs else labs[0])
-                pos = st.selectbox("Fault (positive) class", labs, index=labs.index(dflt))
-            st.markdown("**Hoeffding Adaptive Tree settings**")
-            grace = int(st.number_input("Grace period (rows between split attempts)", 10, 5000, 200, step=10,
-                                        help="Lower = the tree splits sooner and adapts faster, but is noisier."))
-            delta = st.select_slider("Split confidence (delta, smaller = more cautious)", DELTAS, value=1e-7,
-                                     format_func=lambda v: f"{v:.0e}")
-            tau = st.number_input("Tie threshold (tau)", 0.001, 0.5, 0.05, step=0.01, format="%.3f")
-            adwin = st.select_slider("ADWIN sensitivity (larger = reacts to drift sooner)", ADWIN_DELTAS, value=0.002,
-                                     help="Confidence of the drift detector inside each tree node.")
-            win_thr = int(st.number_input("Alternate-tree window (rows)", 50, 5000, 300, step=50,
-                                          help="Rows an alternate subtree must see before it can replace "
-                                               "the original branch."))
-            seed = int(st.number_input("Random seed", 0, 10_000, 42))
-        running = S is not None and S["k"] > 0
-        go_ = False
-        if st.button("Restart with these settings" if S is not None else "Start monitoring", type="primary"):
-            if running:
-                st.session_state["confirm_restart"] = True
-            else:
-                go_ = True
-        if confirm_box("confirm_restart", "This discards the current session (model versions, events, history).",
-                       "Yes, restart"):
-            go_ = True
-        if go_:
-            cfg = dict(train_pct=train_pct, B=B, z=SENS[sens], delay=delay, min_rows=min_rows, snooze=snooze,
-                       hold_frac=hold_frac, metric=metric, pos=pos, seed=seed,
-                       grace=grace, delta=delta, tau=float(tau), adwin=adwin, win_thr=win_thr)
-            try:
-                with st.spinner("Training the first Hoeffding Adaptive Tree..."):
-                    st.session_state["S"] = init_session(df, target, tcol, task, cfg)
-            except ValueError as exc:
-                st.error(str(exc))
-                return
-            st.rerun()
+        except Exception as exc:  # unexpected failure: show it instead of a stack trace
+            st.session_state.pop("result", None)
+            st.error(f"The analysis failed: {exc}")
+        bar.empty()
 
+res = st.session_state.get("result")
 
-def main():
-    st.set_page_config(page_title="Model Drift Dashboard", page_icon="📈", layout="wide")
-    st.markdown(CSS, unsafe_allow_html=True)
-    st.title("📈 Model Drift Dashboard")
-    if not RIVER_OK:
-        st.error("This app needs the `river` package. Install it with `pip install river` and restart.")
-        st.stop()
-    S = st.session_state.get("S")
-    sidebar_config(S)
-    S = st.session_state.get("S")
-    if S is None:
-        st.info("Upload a CSV in the sidebar, choose your columns and click **Start monitoring**.")
-        st.stop()
+# ----------------------------------------------------------------------------
+# KPI cards
+# ----------------------------------------------------------------------------
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Records", f"{len(df):,}")
+k2.metric("Features used", len(num_cols) + len(cat_cols))
+if res is not None:
+    n_events = len(res["adwin_events"]) + len(res["psi_flag_windows"])
+    k3.metric("Drift events", n_events,
+              help=f"ADWIN events: {len(res['adwin_events'])} | PSI drift windows: {len(res['psi_flag_windows'])}")
+    if res["labelled"] and "best" in res:
+        mdf = res["metrics"]
+        latest = mdf[(mdf.strategy == res["best"]) & (mdf.window == mdf.window.max())].iloc[0]
+        label = "F1 (macro)" if res["primary"] == "f1" else "MAE"
+        k4.metric(f"Latest window {label}", f"{latest[res['primary']]:.3f}", help=f"Best strategy: {res['best']}")
+    else:
+        k4.metric("Latest model metric", "n/a", help="Needs a target column and at least one strategy.")
+else:
+    k3.metric("Drift events", "-", help="Press Run Analysis.")
+    k4.metric("Latest model metric", "-", help="Press Run Analysis.")
 
-    done = S["k"] >= S["nb"]
-    off = ready(S) or done
-    with st.container(border=True):
-        b0, b1, b2, b3 = st.columns([2.4, 1, 1, 1])
-        if b0.button("▶ Run until a decision is needed", type="primary", disabled=off, key="run_all"):
-            run(S, None)
-        if b1.button("Next batch", disabled=off, key="run_1"):
-            run(S, 1)
-        if b2.button("Next 10 batches", disabled=off, key="run_10"):
-            run(S, 10)
-        if b3.button("Reset", key="reset"):
-            if S["k"] > 0:
-                st.session_state["confirm_reset"] = True
-            else:
-                st.session_state.pop("S")
-                st.rerun()
-    if confirm_box("confirm_reset", "Reset the session? Model versions, events and history will be discarded.",
-                   "Yes, reset"):
-        st.session_state.pop("S")
-        st.rerun()
+if res is not None and st.session_state.get("result_key") != cfg_key:
+    st.info("Settings changed since the last run. Press Run Analysis to refresh the results below.")
 
-    al = S["alert"]
-    status = ("Finished" if done and not ready(S) else "Decision needed" if ready(S)
-              else "Drift suspected, collecting data" if al else "Monitoring")
-    m = st.columns(4)
-    m[0].metric("Batches received", f"{S['k']} / {S['nb']}")
-    m[1].metric("Deployed model", f"Adaptive tree v{S['version']}")
-    m[2].metric("Retraining events", len(S["retrains"]))
-    m[3].metric("Status", status)
+# ----------------------------------------------------------------------------
+# A. Dataset overview
+# ----------------------------------------------------------------------------
+st.header("A. Dataset overview")
+st.caption(f"Source: {source_name} | rows after dropping missing targets: {len(df):,}"
+           + (f" | task: {task}" if task else " | no target selected"))
+st.dataframe(df.head(100), use_container_width=True, height=250)
+oc1, oc2 = st.columns(2)
+with oc1:
+    st.subheader("Feature data types")
+    st.dataframe(roles, use_container_width=True, hide_index=True)
+with oc2:
+    st.subheader("Missing values")
+    miss = df.isna().sum()
+    miss_df = pd.DataFrame({"column": miss.index, "missing": miss.values,
+                            "missing %": (100 * miss.values / len(df)).round(2)})
+    st.dataframe(miss_df[miss_df.missing > 0] if (miss_df.missing > 0).any() else miss_df.head(0),
+                 use_container_width=True, hide_index=True)
+    if not (miss_df.missing > 0).any():
+        st.caption("No missing values.")
+if task == "classification":
+    st.subheader("Class distribution")
+    dist = df[target].astype(str).value_counts().reset_index()
+    dist.columns = ["class", "count"]
+    st.plotly_chart(px.bar(dist, x="class", y="count", height=300), use_container_width=True)
 
-    if S.get("flash"):
-        lvl, txt = S["flash"]
-        S["flash"] = None
-        getattr(st, lvl)(txt)
+if res is None:
+    st.info("Configure the analysis in the sidebar and press **Run Analysis**.")
+    st.stop()
 
-    if S["k"]:
-        drift_chart(S)
+windows = res["windows"]
+first_w = res["first_flag_window"]
 
-    if al and al["status"] == "waiting":
-        st.info(f"Drift suspected since batch {al['start'] + 1}, but only {new_rows(S):,} of {S['min_rows']:,} new "
-                "labelled rows have arrived. Not enough to retrain safely, so monitoring continues. You will be asked "
-                "once there is enough data, or the alert clears itself if the error returns to normal.")
+# ----------------------------------------------------------------------------
+# B. Drift detection
+# ----------------------------------------------------------------------------
+st.header("B. Drift detection")
+st.caption(f"Reference: rows 0-{res['n_ref'] - 1}. Stream: {len(windows)} windows of about "
+           f"{res['cfg']['batch']} rows. Adaptation was active in {len(res['active_windows'])} of {len(windows)} windows.")
 
-    if ready(S):
-        if S["cand"] is None:
-            with st.spinner("Testing incremental learning on the newest labelled rows..."):
-                try:
-                    S["cand"] = compute_cands(S)
-                except Exception as exc:
-                    S["cand"] = dict(error=f"Could not evaluate candidates: {exc}")
-        decision_panel(S)
+if res["cfg"]["method"] in ("ADWIN", "Both"):
+    st.subheader("ADWIN")
+    if not res["use_adwin"]:
+        st.warning("ADWIN on prediction errors is unavailable because no target column is selected.")
+    else:
+        st.caption("ADWIN watches the prequential error stream of the never-updated static model (0/1 errors for "
+                   "classification, clipped standardised absolute error for regression). It signals that the "
+                   "monitored signal changed. It cannot say which input feature caused the change.")
+        if res["adwin_events"]:
+            ev = pd.DataFrame(res["adwin_events"]).rename(columns={"row": "stream row index", "window": "window #"})
+            st.dataframe(ev, use_container_width=True, hide_index=True, height=min(250, 40 + 35 * len(ev)))
+        else:
+            st.write("No ADWIN drift events were detected.")
 
-    if S["retrains"]:
-        retrain_results(S)
-    if S["events"]:
-        with st.expander("Event log", expanded=False):
-            wide(st.dataframe, pd.DataFrame(S["events"]), hide_index=True)
+if res["use_psi"]:
+    st.subheader("PSI (feature distribution shift)")
+    st.caption("Each window is compared with the fixed reference period using the reference's quantile bins "
+               "(numeric) or category bins with an unseen bucket (categorical). PSI measures input distribution "
+               "shift only. It does not prove concept drift or a drop in model performance.")
+    pt = res["psi_table"]
+    thr = res["cfg"]["psi_thr"]
+    cmap = {"Significant shift": "#d62728", "Moderate shift": "#ff9f1c", "Stable": "#2ca02c"}
+    bar_fig = px.bar(pt, x="max window PSI", y="feature", orientation="h", color="status", color_discrete_map=cmap,
+                     height=max(250, 28 * len(pt) + 100))
+    bar_fig.add_vline(x=thr, line_dash="dash", line_color="black", annotation_text=f"threshold {thr}")
+    bar_fig.update_layout(yaxis=dict(autorange="reversed"))
+    st.plotly_chart(bar_fig, use_container_width=True)
+    st.dataframe(pt, use_container_width=True, hide_index=True)
+    with st.expander("PSI by feature and window (heatmap)"):
+        heat = px.imshow(res["psi_df"].to_numpy(), x=[str(s) for s, _ in windows], y=res["psi_df"].index.tolist(),
+                         aspect="auto", color_continuous_scale="YlOrRd", zmin=0, zmax=max(thr * 2, 0.3),
+                         labels=dict(x="window start row", y="feature", color="PSI"))
+        st.plotly_chart(heat, use_container_width=True)
 
+st.subheader("Drift timeline")
+st.plotly_chart(timeline_fig(res), use_container_width=True)
+if res["delays"] is not None:
+    st.subheader("Detection delay (known onset)")
+    dl = res["delays"]
+    cols_d = st.columns(len(dl))
+    for c_, (k_, v_) in zip(cols_d, dl.items()):
+        c_.metric(k_, "not detected" if v_ is None else v_)
 
-if __name__ == "__main__":
-    main()
+# ----------------------------------------------------------------------------
+# C. Learning strategy comparison
+# ----------------------------------------------------------------------------
+st.header("C. Learning strategy comparison")
+if not res["labelled"]:
+    st.warning("No target column is selected, so the learning strategies were not run.")
+else:
+    summary = res["summary"]
+    prim, higher = res["primary"], res["higher_better"]
+    plabel = "F1 (macro)" if prim == "f1" else "MAE"
+    st.caption("Metrics are pooled over all stream rows. 'Post-drift' uses rows after the first window flagged by the "
+               "selected detector(s). 'Recovery' counts windows from the first degraded window until the metric is "
+               "within 5% of its pre-drift level. All models predict before they are updated.")
+    st.dataframe(summary.style.format({c: "{:.4f}" for c in summary.columns
+                                       if c in ("Accuracy", "F1 (macro)", "Post-drift F1", "MAE", "RMSE", "Post-drift MAE", "Update time (s)")}),
+                 use_container_width=True, hide_index=True)
+
+    smooth = st.checkbox("Smooth with a 3-window rolling mean", value=True)
+    mdf = res["metrics"].sort_values(["strategy", "window"]).copy()
+    mdf["value"] = mdf.groupby("strategy")[prim].transform(lambda s: s.rolling(3, min_periods=1).mean() if smooth else s)
+    mdf["row"] = (mdf["start"] + mdf["end"]) / 2
+    line = px.line(mdf, x="row", y="value", color="strategy", height=420,
+                   labels={"row": "Row index", "value": plabel})
+    line.add_vline(x=res["n_ref"], line_dash="dot", line_color="gray")
+    if first_w is not None:
+        line.add_vline(x=windows[first_w][1], line_dash="dash", line_color="red", annotation_text="first drift signal")
+    st.plotly_chart(line, use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    basis = "post-drift" if res["rank_uses_post_drift"] else "overall"
+    rank_df = pd.DataFrame({"strategy": list(res["rank_basis"].keys()), plabel: list(res["rank_basis"].values())})
+    c1.plotly_chart(px.bar(rank_df, x="strategy", y=plabel, title=f"{plabel} ({basis})", height=360),
+                    use_container_width=True)
+    c2.plotly_chart(px.bar(summary, x="Strategy", y="Update time (s)", title="Total model update time (computational cost)",
+                           height=360), use_container_width=True)
+
+# ----------------------------------------------------------------------------
+# D. Final summary
+# ----------------------------------------------------------------------------
+st.header("D. Final summary")
+lines = []
+if res["use_psi"]:
+    sig = res["psi_table"][res["psi_table"].status == "Significant shift"]["feature"].tolist()
+    mod = res["psi_table"][res["psi_table"].status == "Moderate shift"]["feature"].tolist()
+    lines.append("**Features with distribution shift (PSI):** "
+                 + (", ".join(sig) if sig else f"none reached the {res['cfg']['psi_thr']} threshold")
+                 + (f". Moderate shift: {', '.join(mod)}." if mod else "."))
+    if res["psi_flag_windows"]:
+        w0 = res["psi_flag_windows"][0]
+        lines.append(f"**PSI first flagged** the window starting at row {windows[w0][0]} "
+                     f"({len(res['psi_flag_windows'])} of {len(windows)} windows flagged).")
+if res["use_adwin"]:
+    if res["adwin_events"]:
+        rows_ = [ev["row"] for ev in res["adwin_events"]]
+        lines.append(f"**ADWIN** signalled {len(rows_)} change(s) in the error stream, first at row {rows_[0]}. "
+                     "ADWIN does not identify the responsible feature.")
+    else:
+        lines.append("**ADWIN** found no change in the error stream of the static model.")
+if not res["flagged_windows"]:
+    lines.append("No drift signal was raised by the selected detector(s) on this data and these settings.")
+if res["delays"] is not None:
+    lines.append("**Known onset:** " + "; ".join(f"{k} = {'not detected' if v is None else v}" for k, v in res["delays"].items()) + ".")
+st.markdown("\n\n".join(lines))
+
+if res["labelled"] and "best" in res:
+    s_df = res["summary"].set_index("Strategy")
+    best = res["best"]
+    rank = res["rank_basis"]
+    basis = "post-drift" if res["rank_uses_post_drift"] else "overall (no drift signal, so the whole stream is used)"
+    plabel = "F1 (macro)" if res["primary"] == "f1" else "MAE"
+    st.markdown(f"**Strategy comparison ({basis} {plabel}):**")
+    for name in sorted(rank, key=lambda k: rank[k], reverse=res["higher_better"]):
+        st.markdown(f"- {name}: {rank[name]:.4f}  (update time {s_df.loc[name, 'Update time (s)']:.2f}s, "
+                    f"{int(s_df.loc[name, 'Updates'])} updates)")
+    gap = rank[best] - rank[STATIC] if res["higher_better"] else rank[STATIC] - rank[best]
+    material = gap > (0.01 if res["higher_better"] else 0.02 * abs(rank[STATIC]) + 1e-12)
+    if material:
+        st.success(f"**Best strategy for this dataset and setup: {best}.** It improved {plabel} over the static model "
+                   f"by {abs(gap):.4f} ({basis}). Its update cost was {s_df.loc[best, 'Update time (s)']:.2f}s in total.")
+    else:
+        st.info(f"**{best}** scored best among the selected strategies, but its advantage over the static model "
+                f"({abs(gap):.4f} {plabel}) is small. On this data and setup, adaptation did not clearly help.")
+    st.caption("This is one chronological run with one linear SGD model. Treat differences as indicative, not "
+               "statistically tested. Rankings can change with the window size, trigger policy and detector settings.")
