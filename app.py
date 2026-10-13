@@ -672,20 +672,15 @@ if res is not None and st.session_state.get("result_key") != cfg_key:
 st.header("A. Dataset overview")
 st.caption(f"Source: {source_name} | rows after dropping missing targets: {len(df):,}"
            + (f" | task: {task}" if task else " | no target selected"))
-st.dataframe(df.head(100), use_container_width=True, height=250)
-oc1, oc2 = st.columns(2)
-with oc1:
-    st.subheader("Feature data types")
-    st.dataframe(roles, use_container_width=True, hide_index=True)
-with oc2:
-    st.subheader("Missing values")
-    miss = df.isna().sum()
-    miss_df = pd.DataFrame({"column": miss.index, "missing": miss.values,
-                            "missing %": (100 * miss.values / len(df)).round(2)})
-    st.dataframe(miss_df[miss_df.missing > 0] if (miss_df.missing > 0).any() else miss_df.head(0),
-                 use_container_width=True, hide_index=True)
-    if not (miss_df.missing > 0).any():
-        st.caption("No missing values.")
+st.write(f"**Features used:** {len(num_cols)} numeric ({', '.join(num_cols) or 'none'}), "
+         f"{len(cat_cols)} categorical ({', '.join(cat_cols) or 'none'}).")
+excluded = roles[roles.role == "excluded"]
+if len(excluded):
+    st.write("**Excluded:** " + "; ".join(f"{r.column} ({r.note})" for r in excluded.itertuples()) + ".")
+miss = df.isna().sum()
+miss = miss[miss > 0]
+st.write("**Missing values:** " + (", ".join(f"{c} ({100 * v / len(df):.1f}%)" for c, v in miss.items())
+                                   if len(miss) else "none") + ". Imputed using reference-period statistics.")
 if task == "classification":
     st.subheader("Class distribution")
     dist = df[target].astype(str).value_counts().reset_index()
