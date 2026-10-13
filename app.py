@@ -434,9 +434,8 @@ def timeline_fig(res):
 # Load data
 # ----------------------------------------------------------------------------
 st.title("Model Drift Detection Dashboard")
-st.sidebar.header("Configuration")
 
-uploaded_file = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
+uploaded_file = st.file_uploader("Upload CSV (optional, otherwise data.csv is used)", type=["csv"])
 
 try:
     if uploaded_file is not None:
@@ -461,25 +460,30 @@ df_raw.columns = [str(c) for c in df_raw.columns]
 # Sidebar
 # ----------------------------------------------------------------------------
 cols = list(df_raw.columns)
-target = st.sidebar.selectbox("Target column", cols, index=len(cols) - 1)
-order_choice = st.sidebar.selectbox("Order rows by (optional)", ["(keep file order)"] + cols,
-                                    help="Drift analysis is chronological. Pick a timestamp column if the file is not already in time order.")
+with st.expander("Settings", expanded=True):
+    a1, a2, a3 = st.columns(3)
+    target = a1.selectbox("Target column", cols, index=len(cols) - 1)
+    order_choice = a2.selectbox("Order rows by (optional)", ["(keep file order)"] + cols,
+                                help="Drift analysis is chronological. Pick a timestamp column if the file is not already in time order.")
+    task_choice = a3.radio("Model type", ["Auto", "Classification", "Regression"], horizontal=True,
+                           help="One model per run. Auto picks classification for text or few-valued integer targets, otherwise regression.")
+    b1, b2, b3 = st.columns(3)
+    ref_pct = b1.slider("Reference data (% of rows)", 10, 70, 30)
+    batch = b2.slider("Window / batch size (rows)", 20, 2000, 200, step=10)
+    adwin_delta = b3.number_input("ADWIN delta", min_value=0.000001, max_value=0.5, value=0.002,
+                                  step=0.001, format="%.4f")
+    c1_, c2_, c3_ = st.columns(3)
+    trigger = c1_.radio("Adapt models", ["On drift signal", "Every window"], horizontal=True,
+                        help="'On drift signal': after ADWIN fires, models adapt for the next k windows.")
+    adapt_windows = c2_.slider("Windows to adapt after a drift signal (k)", 1, 10, 3,
+                               disabled=(trigger == "Every window"))
+    buffer_size = c3_.slider("Continual replay buffer size", 100, 5000, 500, step=100)
+    d1, d2 = st.columns(2)
+    strategies = d1.multiselect("Learning strategies", LEARNERS, default=LEARNERS)
+    onset = d2.number_input("Known drift onset row (0 = unknown)", min_value=0, max_value=int(len(df_raw)),
+                            value=0, step=100, help="Optional. Enables detection-delay and false-alarm counts.")
 time_col = None if order_choice == "(keep file order)" else order_choice
-task_choice = st.sidebar.radio("Model type", ["Auto", "Classification", "Regression"], horizontal=True,
-                               help="One model per run. Auto picks classification for text or few-valued integer targets, otherwise regression.")
-ref_pct = st.sidebar.slider("Reference data (% of rows)", 10, 70, 30)
-strategies = st.sidebar.multiselect("Learning strategies", LEARNERS, default=LEARNERS)
-batch = st.sidebar.slider("Window / batch size (rows)", 20, 2000, 200, step=10)
-adwin_delta = st.sidebar.number_input("ADWIN delta", min_value=0.000001, max_value=0.5, value=0.002,
-                                      step=0.001, format="%.4f")
-trigger = st.sidebar.radio("Adapt models", ["On drift signal", "Every window"], horizontal=True,
-                           help="'On drift signal': after ADWIN fires, models adapt for the next k windows.")
-adapt_windows = st.sidebar.slider("Windows to adapt after a drift signal (k)", 1, 10, 3,
-                                  disabled=(trigger == "Every window"))
-buffer_size = st.sidebar.slider("Continual replay buffer size", 100, 5000, 500, step=100)
-onset = st.sidebar.number_input("Known drift onset row (0 = unknown)", min_value=0, max_value=int(len(df_raw)),
-                                value=0, step=100, help="Optional. Enables detection-delay and false-alarm counts.")
-run_clicked = st.sidebar.button("Run Analysis", type="primary", use_container_width=True)
+run_clicked = st.button("Run Analysis", type="primary")
 
 # ----------------------------------------------------------------------------
 # Dataset preparation
@@ -507,7 +511,7 @@ cfg_key = repr((source_name, target, time_col, task, sorted(cfg.items(), key=lam
 
 if run_clicked:
     if not strategies:
-        st.sidebar.error("Select at least one learning strategy.")
+        st.error("Select at least one learning strategy.")
     else:
         bar = st.progress(0.0, text="Starting...")
         try:
@@ -544,38 +548,17 @@ else:
 if res is not None and st.session_state.get("result_key") != cfg_key:
     st.info("Settings changed since the last run. Press Run Analysis to refresh the results below.")
 
-# ----------------------------------------------------------------------------
-# A. Dataset overview
-# ----------------------------------------------------------------------------
-st.header("A. Dataset overview")
-st.caption(f"Source: {source_name} | rows after dropping missing targets: {len(df):,} | model: "
-           + ("SGDClassifier" if task == "classification" else "SGDRegressor"))
-st.write(f"**Features used:** {len(num_cols)} numeric ({', '.join(num_cols) or 'none'}), "
-         f"{len(cat_cols)} categorical ({', '.join(cat_cols) or 'none'}).")
-excluded = roles[roles.role == "excluded"]
-if len(excluded):
-    st.write("**Excluded:** " + "; ".join(f"{r.column} ({r.note})" for r in excluded.itertuples()) + ".")
-miss = df.isna().sum()
-miss = miss[miss > 0]
-st.write("**Missing values:** " + (", ".join(f"{c} ({100 * v / len(df):.1f}%)" for c, v in miss.items())
-                                   if len(miss) else "none") + ". Imputed using reference-period statistics.")
-if task == "classification":
-    st.subheader("Class distribution")
-    dist = df[target].astype(str).value_counts().reset_index()
-    dist.columns = ["class", "count"]
-    st.plotly_chart(px.bar(dist, x="class", y="count", height=300), use_container_width=True)
-
 if res is None:
-    st.info("Configure the analysis in the sidebar and press **Run Analysis**.")
+    st.info("Adjust the settings above and press **Run Analysis**.")
     st.stop()
 
 windows = res["windows"]
 first_w = res["first_flag_window"]
 
 # ----------------------------------------------------------------------------
-# B. Drift detection (ADWIN)
+# A. Drift detection (ADWIN)
 # ----------------------------------------------------------------------------
-st.header("B. Drift detection (ADWIN)")
+st.header("A. Drift detection (ADWIN)")
 st.caption(f"Reference: rows 0-{res['n_ref'] - 1}. Stream: {len(windows)} windows of about "
            f"{res['cfg']['batch']} rows. Adaptation was active in {len(res['active_windows'])} of {len(windows)} windows.")
 st.caption("ADWIN watches the prequential error stream of the never-updated static model (0/1 errors for "
@@ -594,9 +577,9 @@ if res["delays"] is not None:
         c_.metric(k_, "not detected" if v_ is None else v_)
 
 # ----------------------------------------------------------------------------
-# C. Learning strategy comparison
+# B. Learning strategy comparison
 # ----------------------------------------------------------------------------
-st.header("C. Learning strategy comparison")
+st.header("B. Learning strategy comparison")
 summary = res["summary"]
 prim, higher = res["primary"], res["higher_better"]
 plabel = "F1 (macro)" if prim == "f1" else "MAE"
@@ -624,36 +607,3 @@ c1.plotly_chart(px.bar(rank_df, x="strategy", y=plabel, title=f"{plabel} ({basis
                 use_container_width=True)
 c2.plotly_chart(px.bar(summary, x="Strategy", y="Update time (s)", title="Total model update time (computational cost)",
                        height=360), use_container_width=True)
-
-# ----------------------------------------------------------------------------
-# D. Final summary
-# ----------------------------------------------------------------------------
-st.header("D. Final summary")
-lines = []
-if res["adwin_events"]:
-    rows_ = [ev["row"] for ev in res["adwin_events"]]
-    lines.append(f"**ADWIN** signalled {len(rows_)} change(s) in the error stream, first at row {rows_[0]}. "
-                 "ADWIN does not identify which feature is responsible, so no feature-level drift is claimed.")
-else:
-    lines.append("**ADWIN** found no change in the error stream of the static model on this data and these settings.")
-if res["delays"] is not None:
-    lines.append("**Known onset:** " + "; ".join(f"{k} = {'not detected' if v is None else v}" for k, v in res["delays"].items()) + ".")
-st.markdown("\n\n".join(lines))
-
-s_df = res["summary"].set_index("Strategy")
-best, rank = res["best"], res["rank_basis"]
-basis = "post-drift" if res["rank_uses_post_drift"] else "overall (no drift signal, so the whole stream is used)"
-st.markdown(f"**Strategy comparison ({basis} {plabel}):**")
-for name in sorted(rank, key=lambda k: rank[k], reverse=higher):
-    st.markdown(f"- {name}: {rank[name]:.4f}  (update time {s_df.loc[name, 'Update time (s)']:.2f}s, "
-                f"{int(s_df.loc[name, 'Updates'])} updates)")
-gap = rank[best] - rank[STATIC] if higher else rank[STATIC] - rank[best]
-material = gap > (0.01 if higher else 0.02 * abs(rank[STATIC]) + 1e-12)
-if material:
-    st.success(f"**Best strategy for this dataset and setup: {best}.** It improved {plabel} over the static model "
-               f"by {abs(gap):.4f} ({basis}). Its update cost was {s_df.loc[best, 'Update time (s)']:.2f}s in total.")
-else:
-    st.info(f"**{best}** scored best among the selected strategies, but its advantage over the static model "
-            f"({abs(gap):.4f} {plabel}) is small. On this data and setup, adaptation did not clearly help.")
-st.caption("This is one chronological run with one linear SGD model. Treat differences as indicative, not "
-           "statistically tested. Rankings can change with the window size, trigger policy and ADWIN delta.")
