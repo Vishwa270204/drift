@@ -1,20 +1,16 @@
 """Model Drift Detection Dashboard (single file, ADWIN only).
 
-One model family per run, chosen from the target column:
-    classification -> SGDClassifier,  regression -> SGDRegressor
-Drift is detected with ADWIN on the prequential prediction errors of that model.
-Learning strategies that adapt the model are compared:
+Fixed setup (no user choice):
+    * Target column  = last column of the CSV (or set TARGET_COL below)
+    * Model family   = auto-detected from the target (classification -> SGDClassifier, regression -> SGDRegressor)
+    * Training data  = first REF_PCT % of rows (reference period)
+    * Adaptation     = ONLY after an ADWIN drift signal, for the next k windows
 
-    Static (baseline), Incremental, Online, Continual, Transfer (+ a scratch baseline)
-
-Protocol (identical for every strategy, strictly chronological):
-    1. The first N% of rows are the REFERENCE period. A source model is trained on it.
-    2. The remaining rows are replayed as consecutive WINDOWS.
-    3. For every window: every model PREDICTS first (nothing has been trained on
-       this window yet), then labels "arrive", ADWIN runs, and models may update.
-    4. An ADWIN signal at the end of window t switches adaptation on for the next
-       k windows (or adaptation can run on every window). Detection and adaptation
-       are separate steps: a signal never retrains anything by itself.
+Protocol (strictly chronological):
+    1. Reference period -> source model is trained.
+    2. Remaining rows are replayed as consecutive WINDOWS.
+    3. Every model PREDICTS first, then labels arrive, ADWIN runs, models may update.
+    4. An ADWIN signal at the end of window t switches adaptation on for the next k windows.
 
 Run:  streamlit run app.py
 """
@@ -42,9 +38,11 @@ DEFAULT_CSV_PATH = "data.csv"
 # ----------------------------------------------------------------------------
 # Constants
 # ----------------------------------------------------------------------------
-MAX_CAT_UNIQUE = 50     # categorical columns with more levels are treated as ID-like and excluded
-TARGET_CAP = 2000       # most recent labelled target-period rows kept for Transfer / Scratch
-TRANSFER_EPOCHS = 3     # passes over the target buffer per Transfer / Scratch update
+TARGET_COL = None       # None -> last column of the CSV; or put a fixed column name here
+REF_PCT = 30            # FIXED size of the training (reference) data, in % of rows
+MAX_CAT_UNIQUE = 50
+TARGET_CAP = 2000
+TRANSFER_EPOCHS = 3
 SEED = 42
 
 STATIC = "Static (no adaptation)"
@@ -55,14 +53,75 @@ TRANS = "Transfer"
 SCRATCH = "Scratch (target-only baseline)"
 LEARNERS = [INCR, ONLINE, CONT, TRANS]
 
-st.set_page_config(page_title="Model Drift Dashboard", layout="wide")
+PALETTE = ["#6366F1", "#06B6D4", "#F59E0B", "#10B981", "#EF4444", "#8B5CF6"]
+
+st.set_page_config(page_title="Model Drift Dashboard", page_icon="📉", layout="wide")
+
+# ----------------------------------------------------------------------------
+# Styling
+# ----------------------------------------------------------------------------
+st.markdown(
+    """
+<style>
+.block-container {padding-top: 1.6rem; max-width: 1280px;}
+.hero {
+    background: linear-gradient(120deg, #4F46E5 0%, #7C3AED 50%, #06B6D4 100%);
+    padding: 1.8rem 2rem; border-radius: 18px; color: #fff; margin-bottom: 1.2rem;
+    box-shadow: 0 10px 30px rgba(79,70,229,.25);
+}
+.hero h1 {margin: 0; font-size: 2rem; font-weight: 750; color: #fff;}
+.hero p {margin: .35rem 0 0 0; opacity: .92; font-size: 1.02rem;}
+.chip {
+    display: inline-block; padding: .28rem .8rem; margin: .5rem .4rem 0 0; border-radius: 999px;
+    background: rgba(255,255,255,.18); border: 1px solid rgba(255,255,255,.35);
+    font-size: .82rem; font-weight: 600; color: #fff;
+}
+div[data-testid="stMetric"] {
+    background: rgba(99,102,241,.07); border: 1px solid rgba(99,102,241,.22);
+    border-left: 5px solid #6366F1; padding: .9rem 1.1rem; border-radius: 14px;
+}
+div[data-testid="stMetricLabel"] {font-weight: 600; opacity: .8;}
+div[data-testid="stMetricValue"] {font-weight: 750;}
+.stTabs [data-baseweb="tab-list"] {gap: .5rem;}
+.stTabs [data-baseweb="tab"] {
+    background: rgba(99,102,241,.08); border-radius: 10px 10px 0 0; padding: .55rem 1.2rem; font-weight: 600;
+}
+.stTabs [aria-selected="true"] {background: rgba(99,102,241,.22);}
+.stButton > button[kind="primary"] {
+    background: linear-gradient(90deg, #4F46E5, #7C3AED); border: 0; border-radius: 12px;
+    padding: .65rem 2rem; font-weight: 700; box-shadow: 0 6px 16px rgba(79,70,229,.3);
+}
+.stButton > button[kind="primary"]:hover {filter: brightness(1.08);}
+.section-note {
+    background: rgba(6,182,212,.08); border-left: 4px solid #06B6D4;
+    padding: .7rem 1rem; border-radius: 8px; margin-bottom: .8rem; font-size: .92rem;
+}
+.best-badge {
+    background: linear-gradient(90deg, #10B981, #06B6D4); color: #fff; padding: .6rem 1.1rem;
+    border-radius: 12px; font-weight: 650; display: inline-block; margin: .4rem 0 1rem 0;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+def style_fig(fig, height=420):
+    fig.update_layout(
+        template="plotly_white", height=height, colorway=PALETTE,
+        margin=dict(t=50, l=10, r=10, b=10), font=dict(size=13),
+        legend=dict(orientation="h", y=-0.22, title_text=""),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+    )
+    fig.update_xaxes(gridcolor="rgba(150,150,150,.2)")
+    fig.update_yaxes(gridcolor="rgba(150,150,150,.2)")
+    return fig
 
 
 # ----------------------------------------------------------------------------
 # Data preparation
 # ----------------------------------------------------------------------------
 def prepare_df(df_raw, target, time_col):
-    """Replace inf, drop rows without a target, optionally sort chronologically."""
     df = df_raw.replace([np.inf, -np.inf], np.nan).dropna(subset=[target])
     if time_col is not None:
         key = df[time_col]
@@ -77,7 +136,6 @@ def prepare_df(df_raw, target, time_col):
 
 
 def split_columns(df, target, time_col):
-    """Return numeric columns, categorical columns and a role table (with exclusion reasons)."""
     num_cols, cat_cols, roles = [], [], []
     for c in df.columns:
         s = df[c]
@@ -116,7 +174,6 @@ def detect_task(y):
 
 
 def feature_frame(df, num_cols, cat_cols):
-    """Feature columns with categoricals as strings (missing stays NaN)."""
     X = df[num_cols + cat_cols].copy()
     for c in cat_cols:
         col = X[c].astype(object)
@@ -134,7 +191,6 @@ def make_model(task):
 
 
 def fit_epochs(model, X, y, task, classes, epochs=1, rng=None):
-    """Run `partial_fit` for a number of shuffled passes (works for fresh and trained models)."""
     rng = rng if rng is not None else np.random.default_rng(SEED)
     for _ in range(epochs):
         order = rng.permutation(len(y))
@@ -157,7 +213,6 @@ def score(task, y_true, y_pred):
 
 
 def reservoir_add(Xb, yb, filled, seen, Xn, yn, rng):
-    """Bounded replay buffer: reservoir sampling keeps a uniform sample of everything seen."""
     cap = len(yb)
     for i in range(len(yn)):
         seen += 1
@@ -172,7 +227,6 @@ def reservoir_add(Xb, yb, filled, seen, Xn, yn, rng):
 
 
 def make_windows(n_ref, n, batch):
-    """Consecutive (start, end) windows; a short last chunk is merged into the previous window."""
     bounds = list(range(n_ref, n, batch))
     windows = [(s, min(s + batch, n)) for s in bounds]
     if len(windows) > 1 and windows[-1][1] - windows[-1][0] < batch // 2:
@@ -182,7 +236,6 @@ def make_windows(n_ref, n, batch):
 
 
 def recovery_text(scores, first_w, higher_better, tol=0.05):
-    """Windows between the first degraded window after the drift signal and recovery (within 5% of pre-drift level)."""
     if first_w is None:
         return "n/a (no drift signal)"
     if first_w == 0:
@@ -205,13 +258,12 @@ def recovery_text(scores, first_w, higher_better, tol=0.05):
 # ----------------------------------------------------------------------------
 def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
     n = len(df)
-    n_ref = int(n * cfg["ref_pct"] / 100)
+    n_ref = int(n * REF_PCT / 100)
     if n_ref < 50:
-        raise ValueError("The reference period has fewer than 50 rows. Increase the reference percentage.")
+        raise ValueError("The fixed training (reference) period has fewer than 50 rows. Use a larger dataset.")
     windows = make_windows(n_ref, n, cfg["batch"])
     if len(windows) < 3:
-        raise ValueError("Fewer than 3 evaluation windows. Reduce the window size or the reference percentage.")
-    always = cfg["trigger"] == "Every window"
+        raise ValueError("Fewer than 3 evaluation windows. Reduce the window size.")
     X_df = feature_frame(df, num_cols, cat_cols)
     rng = np.random.default_rng(SEED)
 
@@ -228,18 +280,18 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
 
     classes = None
     if task == "classification":
-        le = LabelEncoder().fit(df[target].astype(str))  # only the label vocabulary comes from all rows
+        le = LabelEncoder().fit(df[target].astype(str))
         y_all = le.transform(df[target].astype(str))
         classes = np.arange(len(le.classes_))
         y_true_all = y_all
         mu, sd = 0.0, 1.0
         if len(np.unique(y_all[:n_ref])) < 2:
-            raise ValueError("The reference period contains a single class. Increase the reference percentage.")
+            raise ValueError("The reference period contains a single class. Use a different dataset.")
     else:
         y_raw = df[target].astype(float).to_numpy()
         mu = float(y_raw[:n_ref].mean())
         sd = float(y_raw[:n_ref].std()) or 1.0
-        y_all = (y_raw - mu) / sd  # target scaling uses reference statistics only
+        y_all = (y_raw - mu) / sd
         y_true_all = y_raw
 
     # --- one source model, trained on the reference period ---
@@ -249,7 +301,7 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
     for name in cfg["strategies"]:
         models[name] = copy.deepcopy(base)
     if TRANS in cfg["strategies"]:
-        models[SCRATCH] = None  # fitted at the first adaptation; until then the source model predicts
+        models[SCRATCH] = None
 
     d = X_all.shape[1]
     cap = cfg["buffer"]
@@ -272,11 +324,11 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
     metric_rows, preds_store = [], {name: [] for name in models}
     upd_time = {name: 0.0 for name in models}
     upd_count = {name: 0 for name in models}
-    remaining = 0
+    remaining = 0  # windows of adaptation left (only set by an ADWIN drift signal)
 
     for w, (s, e) in enumerate(windows):
         progress((w + 1) / len(windows), f"Window {w + 1} / {len(windows)}")
-        active = always or remaining > 0
+        active = remaining > 0  # adaptation is ON only after a drift signal
         if active:
             active_windows.append(w)
         Xw, yw = X_all[s:e], y_all[s:e]
@@ -285,7 +337,6 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
         raw = {}
         for name in models:
             if name == ONLINE and active:
-                # true prequential: predict row i, then learn row i
                 out, t_up = [], 0.0
                 for i in range(len(yw)):
                     xi = Xw[i:i + 1]
@@ -303,11 +354,11 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
             metric_rows.append({"strategy": name, "window": w, "start": s, "end": e,
                                 **score(task, y_true_all[s:e], to_orig(p))})
 
-        # 2) DETECT: ADWIN on the errors of the NEVER-updated static model (independent of adaptation)
+        # 2) DETECT: ADWIN on the errors of the never-updated static model
         if task == "classification":
             errors = (raw[STATIC] != yw).astype(float)
         else:
-            errors = np.clip(np.abs(raw[STATIC] - yw), 0, 5)  # standardised absolute error, clipped for stability
+            errors = np.clip(np.abs(raw[STATIC] - yw), 0, 5)
         flagged = False
         for i, err in enumerate(errors):
             adwin.update(float(err))
@@ -317,7 +368,7 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
         if flagged:
             flagged_windows.append(w)
 
-        # 3) ADAPT (labels are available now; only models that are allowed to adapt are updated)
+        # 3) ADAPT (only while adaptation is active)
         if CONT in models:
             if active and filled > 0:
                 k = min(len(yw), filled)
@@ -337,20 +388,20 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
             Xt, yt = np.vstack([Xt, Xw])[-TARGET_CAP:], np.concatenate([yt, yw])[-TARGET_CAP:]
             if active:
                 t0 = time.perf_counter()
-                tm = copy.deepcopy(base)  # start from the frozen source model
+                tm = copy.deepcopy(base)
                 fit_epochs(tm, Xt, yt, task, classes, epochs=TRANSFER_EPOCHS, rng=rng)
                 upd_time[TRANS] += time.perf_counter() - t0
                 models[TRANS] = tm
                 upd_count[TRANS] += 1
                 t0 = time.perf_counter()
-                sm = make_model(task)  # same data and budget, random start
+                sm = make_model(task)
                 fit_epochs(sm, Xt, yt, task, classes, epochs=TRANSFER_EPOCHS, rng=rng)
                 upd_time[SCRATCH] += time.perf_counter() - t0
                 models[SCRATCH] = sm
                 upd_count[SCRATCH] += 1
 
-        # 4) update the adaptation switch for the NEXT windows
-        if active and not always:
+        # 4) adaptation switch for the NEXT windows
+        if active:
             remaining -= 1
         if flagged:
             remaining = cfg["adapt_windows"]
@@ -415,25 +466,29 @@ def timeline_fig(res):
     sdf = res["metrics"][res["metrics"].strategy == STATIC].sort_values("window")
     y = sdf[prim].to_numpy()
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=mid, y=y, mode="lines+markers", name=f"Static model {ylabel}"))
+    fig.add_trace(go.Scatter(x=mid, y=y, mode="lines+markers", name=f"Static model {ylabel}",
+                             line=dict(width=3, color=PALETTE[0]), marker=dict(size=7),
+                             fill="tozeroy", fillcolor="rgba(99,102,241,.08)"))
     lo, hi = float(np.min(y)), float(np.max(y))
     pad = (hi - lo) * 0.12 or 0.05
     if res["adwin_events"]:
         fig.add_trace(go.Scatter(x=[ev["row"] for ev in res["adwin_events"]], y=[lo - pad] * len(res["adwin_events"]),
                                  mode="markers", name="ADWIN drift event",
-                                 marker=dict(symbol="triangle-up", color="red", size=10)))
+                                 marker=dict(symbol="triangle-up", color="#EF4444", size=12)))
     fig.add_vline(x=res["n_ref"], line_dash="dot", line_color="gray", annotation_text="end of reference")
     if res["cfg"]["onset"] > 0:
-        fig.add_vline(x=res["cfg"]["onset"], line_dash="dash", line_color="green", annotation_text="known onset")
-    fig.update_layout(xaxis_title="Row index", yaxis_title=ylabel, height=420, margin=dict(t=30),
-                      legend=dict(orientation="h", y=-0.2))
-    return fig
+        fig.add_vline(x=res["cfg"]["onset"], line_dash="dash", line_color="#10B981", annotation_text="known onset")
+    fig.update_layout(xaxis_title="Row index", yaxis_title=ylabel)
+    return style_fig(fig, 420)
 
 
 # ----------------------------------------------------------------------------
 # Load data
 # ----------------------------------------------------------------------------
-st.title("Model Drift Detection Dashboard")
+HERO_TITLE = '''<h1>📉 Model Drift Detection Dashboard</h1>
+  <p>ADWIN drift detection on prequential errors, with adaptation that starts only after a drift signal.</p>'''
+hero_ph = st.empty()
+hero_ph.markdown(f'<div class="hero">{HERO_TITLE}</div>', unsafe_allow_html=True)  # title first, chips added later
 
 uploaded_file = st.file_uploader("Upload CSV (optional, otherwise data.csv is used)", type=["csv"])
 
@@ -447,7 +502,7 @@ try:
     else:
         st.warning("Upload a CSV file or add data.csv to the project.")
         st.stop()
-except Exception as exc:  # unreadable / malformed file
+except Exception as exc:
     st.error(f"Could not read the CSV file: {exc}")
     st.stop()
 
@@ -457,33 +512,29 @@ if df_raw.shape[0] < 100 or df_raw.shape[1] < 2:
 df_raw.columns = [str(c) for c in df_raw.columns]
 
 # ----------------------------------------------------------------------------
-# Sidebar
+# Fixed target + automatic task
 # ----------------------------------------------------------------------------
 cols = list(df_raw.columns)
-with st.expander("Settings", expanded=True):
+target = TARGET_COL if TARGET_COL in cols else cols[-1]
+
+# ----------------------------------------------------------------------------
+# Settings
+# ----------------------------------------------------------------------------
+with st.expander("⚙️ Settings", expanded=True):
     a1, a2, a3 = st.columns(3)
-    target = a1.selectbox("Target column", cols, index=len(cols) - 1)
-    order_choice = a2.selectbox("Order rows by (optional)", ["(keep file order)"] + cols,
+    order_choice = a1.selectbox("Order rows by (optional)", ["(keep file order)"] + [c for c in cols if c != target],
                                 help="Drift analysis is chronological. Pick a timestamp column if the file is not already in time order.")
-    task_choice = a3.radio("Model type", ["Auto", "Classification", "Regression"], horizontal=True,
-                           help="One model per run. Auto picks classification for text or few-valued integer targets, otherwise regression.")
-    b1, b2, b3 = st.columns(3)
-    ref_pct = b1.slider("Reference data (% of rows)", 10, 70, 30)
-    batch = b2.slider("Window / batch size (rows)", 20, 2000, 200, step=10)
-    adwin_delta = b3.number_input("ADWIN delta", min_value=0.000001, max_value=0.5, value=0.002,
+    batch = a2.slider("Window / batch size (rows)", 20, 2000, 200, step=10)
+    adwin_delta = a3.number_input("ADWIN delta", min_value=0.000001, max_value=0.5, value=0.002,
                                   step=0.001, format="%.4f")
-    c1_, c2_, c3_ = st.columns(3)
-    trigger = c1_.radio("Adapt models", ["On drift signal", "Every window"], horizontal=True,
-                        help="'On drift signal': after ADWIN fires, models adapt for the next k windows.")
-    adapt_windows = c2_.slider("Windows to adapt after a drift signal (k)", 1, 10, 3,
-                               disabled=(trigger == "Every window"))
-    buffer_size = c3_.slider("Continual replay buffer size", 100, 5000, 500, step=100)
+    b1, b2 = st.columns(2)
+    adapt_windows = b1.slider("Windows to adapt after a drift signal (k)", 1, 10, 3)
+    buffer_size = b2.slider("Continual replay buffer size", 100, 5000, 500, step=100)
     d1, d2 = st.columns(2)
     strategies = d1.multiselect("Learning strategies", LEARNERS, default=LEARNERS)
     onset = d2.number_input("Known drift onset row (0 = unknown)", min_value=0, max_value=int(len(df_raw)),
                             value=0, step=100, help="Optional. Enables detection-delay and false-alarm counts.")
 time_col = None if order_choice == "(keep file order)" else order_choice
-run_clicked = st.button("Run Analysis", type="primary")
 
 # ----------------------------------------------------------------------------
 # Dataset preparation
@@ -494,19 +545,35 @@ if len(num_cols) + len(cat_cols) == 0:
     st.error("No usable feature columns were found after excluding the target and invalid columns.")
     st.stop()
 
-task = detect_task(df[target]) if task_choice == "Auto" else task_choice.lower()
-if task == "regression" and not pd.api.types.is_numeric_dtype(df[target]):
-    st.error("Regression needs a numeric target column.")
-    st.stop()
+task = detect_task(df[target])
 if task == "classification" and df[target].nunique() > 50:
-    st.error("The target has more than 50 distinct values. Choose Regression or a different target.")
+    st.error("The target (last column) has more than 50 distinct values for classification. Use a different dataset.")
     st.stop()
+model_name = "SGDClassifier" if task == "classification" else "SGDRegressor"
+
+# ----------------------------------------------------------------------------
+# Hero header
+# ----------------------------------------------------------------------------
+hero_ph.markdown(
+    f"""
+<div class="hero">
+  {HERO_TITLE}
+  <span class="chip">🎯 Target: {target}</span>
+  <span class="chip">🤖 {task.capitalize()} · {model_name}</span>
+  <span class="chip">📚 Training data: first {REF_PCT}% of rows</span>
+  <span class="chip">⚡ Adapt after drift only</span>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+run_clicked = st.button("▶ Run Analysis", type="primary")
 
 # ----------------------------------------------------------------------------
 # Run
 # ----------------------------------------------------------------------------
-cfg = {"ref_pct": ref_pct, "strategies": strategies, "batch": batch, "adwin_delta": float(adwin_delta),
-       "trigger": trigger, "adapt_windows": adapt_windows, "buffer": buffer_size, "onset": int(onset)}
+cfg = {"strategies": strategies, "batch": batch, "adwin_delta": float(adwin_delta),
+       "adapt_windows": adapt_windows, "buffer": buffer_size, "onset": int(onset)}
 cfg_key = repr((source_name, target, time_col, task, sorted(cfg.items(), key=lambda kv: kv[0])))
 
 if run_clicked:
@@ -522,7 +589,7 @@ if run_clicked:
         except ValueError as exc:
             st.session_state.pop("result", None)
             st.error(str(exc))
-        except Exception as exc:  # unexpected failure: show it instead of a stack trace
+        except Exception as exc:
             st.session_state.pop("result", None)
             st.error(f"The analysis failed: {exc}")
         bar.empty()
@@ -533,17 +600,20 @@ res = st.session_state.get("result")
 # KPI cards
 # ----------------------------------------------------------------------------
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Records", f"{len(df):,}")
-k2.metric("Features used", len(num_cols) + len(cat_cols))
+k1.metric("📄 Records", f"{len(df):,}")
+k2.metric("🧩 Features used", len(num_cols) + len(cat_cols))
 if res is not None:
-    k3.metric("Drift events (ADWIN)", len(res["adwin_events"]))
+    k3.metric("🚨 Drift events (ADWIN)", len(res["adwin_events"]))
     mdf = res["metrics"]
     latest = mdf[(mdf.strategy == res["best"]) & (mdf.window == mdf.window.max())].iloc[0]
     label = "F1 (macro)" if res["primary"] == "f1" else "MAE"
-    k4.metric(f"Latest window {label}", f"{latest[res['primary']]:.3f}", help=f"Best strategy: {res['best']}")
+    k4.metric(f"🏁 Latest window {label}", f"{latest[res['primary']]:.3f}", help=f"Best strategy: {res['best']}")
 else:
-    k3.metric("Drift events (ADWIN)", "-", help="Press Run Analysis.")
-    k4.metric("Latest model metric", "-", help="Press Run Analysis.")
+    k3.metric("🚨 Drift events (ADWIN)", "-", help="Press Run Analysis.")
+    k4.metric("🏁 Latest model metric", "-", help="Press Run Analysis.")
+
+with st.expander("Column roles"):
+    st.dataframe(roles, use_container_width=True, hide_index=True)
 
 if res is not None and st.session_state.get("result_key") != cfg_key:
     st.info("Settings changed since the last run. Press Run Analysis to refresh the results below.")
@@ -554,56 +624,66 @@ if res is None:
 
 windows = res["windows"]
 first_w = res["first_flag_window"]
+prim, higher = res["primary"], res["higher_better"]
+plabel = "F1 (macro)" if prim == "f1" else "MAE"
+
+st.markdown(f'<div class="best-badge">🏆 Best strategy: {res["best"]}</div>', unsafe_allow_html=True)
+
+tab_a, tab_b = st.tabs(["🔍 Drift detection (ADWIN)", "📊 Learning strategy comparison"])
 
 # ----------------------------------------------------------------------------
-# A. Drift detection (ADWIN)
+# A. Drift detection
 # ----------------------------------------------------------------------------
-st.header("A. Drift detection (ADWIN)")
-st.caption(f"Reference: rows 0-{res['n_ref'] - 1}. Stream: {len(windows)} windows of about "
-           f"{res['cfg']['batch']} rows. Adaptation was active in {len(res['active_windows'])} of {len(windows)} windows.")
-st.caption("ADWIN watches the prequential error stream of the never-updated static model (0/1 errors for "
-           "classification, clipped standardised absolute error for regression). It signals that the monitored "
-           "signal changed. It cannot say which input feature caused the change.")
-st.plotly_chart(timeline_fig(res), use_container_width=True)
-if res["adwin_events"]:
-    ev = pd.DataFrame(res["adwin_events"]).rename(columns={"row": "stream row index", "window": "window #"})
-    st.dataframe(ev, use_container_width=True, hide_index=True, height=min(250, 40 + 35 * len(ev)))
-else:
-    st.write("No ADWIN drift events were detected.")
-if res["delays"] is not None:
-    st.subheader("Detection delay (known onset)")
-    cols_d = st.columns(len(res["delays"]))
-    for c_, (k_, v_) in zip(cols_d, res["delays"].items()):
-        c_.metric(k_, "not detected" if v_ is None else v_)
+with tab_a:
+    st.caption(f"Reference: rows 0-{res['n_ref'] - 1}. Stream: {len(windows)} windows of about "
+               f"{res['cfg']['batch']} rows. Adaptation was active in {len(res['active_windows'])} of {len(windows)} windows.")
+    st.markdown('<div class="section-note">ADWIN watches the prequential error stream of the never-updated static model '
+                '(0/1 errors for classification, clipped standardised absolute error for regression). It signals that the '
+                'monitored signal changed. It cannot say which input feature caused the change.</div>',
+                unsafe_allow_html=True)
+    st.plotly_chart(timeline_fig(res), use_container_width=True)
+    if res["adwin_events"]:
+        ev = pd.DataFrame(res["adwin_events"]).rename(columns={"row": "stream row index", "window": "window #"})
+        st.dataframe(ev, use_container_width=True, hide_index=True, height=min(250, 40 + 35 * len(ev)))
+    else:
+        st.success("No ADWIN drift events were detected.")
+    if res["delays"] is not None:
+        st.subheader("Detection delay (known onset)")
+        cols_d = st.columns(len(res["delays"]))
+        for c_, (k_, v_) in zip(cols_d, res["delays"].items()):
+            c_.metric(k_, "not detected" if v_ is None else v_)
 
 # ----------------------------------------------------------------------------
 # B. Learning strategy comparison
 # ----------------------------------------------------------------------------
-st.header("B. Learning strategy comparison")
-summary = res["summary"]
-prim, higher = res["primary"], res["higher_better"]
-plabel = "F1 (macro)" if prim == "f1" else "MAE"
-st.caption("Metrics are pooled over all stream rows. 'Post-drift' uses rows after the first window with an ADWIN event. "
-           "'Recovery' counts windows from the first degraded window until the metric is within 5% of its "
-           "pre-drift level. All models predict before they are updated.")
-st.dataframe(summary.style.format({c: "{:.4f}" for c in summary.columns
-                                   if c in ("Accuracy", "F1 (macro)", "Post-drift F1", "MAE", "RMSE", "Post-drift MAE", "Update time (s)")}),
-             use_container_width=True, hide_index=True)
+with tab_b:
+    summary = res["summary"]
+    st.caption("Metrics are pooled over all stream rows. 'Post-drift' uses rows after the first window with an ADWIN event. "
+               "'Recovery' counts windows from the first degraded window until the metric is within 5% of its "
+               "pre-drift level. All models predict before they are updated.")
+    st.dataframe(summary.style.format({c: "{:.4f}" for c in summary.columns
+                                       if c in ("Accuracy", "F1 (macro)", "Post-drift F1", "MAE", "RMSE",
+                                                "Post-drift MAE", "Update time (s)")}),
+                 use_container_width=True, hide_index=True)
 
-smooth = st.checkbox("Smooth with a 3-window rolling mean", value=True)
-mdf = res["metrics"].sort_values(["strategy", "window"]).copy()
-mdf["value"] = mdf.groupby("strategy")[prim].transform(lambda s: s.rolling(3, min_periods=1).mean() if smooth else s)
-mdf["row"] = (mdf["start"] + mdf["end"]) / 2
-line = px.line(mdf, x="row", y="value", color="strategy", height=420, labels={"row": "Row index", "value": plabel})
-line.add_vline(x=res["n_ref"], line_dash="dot", line_color="gray")
-if first_w is not None:
-    line.add_vline(x=windows[first_w][1], line_dash="dash", line_color="red", annotation_text="first drift signal")
-st.plotly_chart(line, use_container_width=True)
+    smooth = st.checkbox("Smooth with a 3-window rolling mean", value=True)
+    mdf = res["metrics"].sort_values(["strategy", "window"]).copy()
+    mdf["value"] = mdf.groupby("strategy")[prim].transform(
+        lambda s: s.rolling(3, min_periods=1).mean() if smooth else s)
+    mdf["row"] = (mdf["start"] + mdf["end"]) / 2
+    line = px.line(mdf, x="row", y="value", color="strategy", labels={"row": "Row index", "value": plabel})
+    line.update_traces(line=dict(width=3))
+    line.add_vline(x=res["n_ref"], line_dash="dot", line_color="gray")
+    if first_w is not None:
+        line.add_vline(x=windows[first_w][1], line_dash="dash", line_color="#EF4444", annotation_text="first drift signal")
+    st.plotly_chart(style_fig(line, 420), use_container_width=True)
 
-c1, c2 = st.columns(2)
-basis = "post-drift" if res["rank_uses_post_drift"] else "overall"
-rank_df = pd.DataFrame({"strategy": list(res["rank_basis"].keys()), plabel: list(res["rank_basis"].values())})
-c1.plotly_chart(px.bar(rank_df, x="strategy", y=plabel, title=f"{plabel} ({basis})", height=360),
-                use_container_width=True)
-c2.plotly_chart(px.bar(summary, x="Strategy", y="Update time (s)", title="Total model update time (computational cost)",
-                       height=360), use_container_width=True)
+    c1, c2 = st.columns(2)
+    basis = "post-drift" if res["rank_uses_post_drift"] else "overall"
+    rank_df = pd.DataFrame({"strategy": list(res["rank_basis"].keys()), plabel: list(res["rank_basis"].values())})
+    c1.plotly_chart(style_fig(px.bar(rank_df, x="strategy", y=plabel, color="strategy",
+                                     title=f"{plabel} ({basis})").update_layout(showlegend=False), 360),
+                    use_container_width=True)
+    c2.plotly_chart(style_fig(px.bar(summary, x="Strategy", y="Update time (s)", color="Strategy",
+                                     title="Total model update time (computational cost)").update_layout(showlegend=False), 360),
+                    use_container_width=True)
