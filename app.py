@@ -94,7 +94,7 @@ HERO_TITLE = '''<h1>📉 Model Drift Detection Dashboard</h1>
 hero_ph = st.empty()
 hero_ph.markdown(f'<div class="hero">{HERO_TITLE}</div>', unsafe_allow_html=True)  # title first, chips added later
 
-uploaded_file = st.file_uploader("Upload CSV (optional, otherwise data.csv is used)", type=["csv"])
+uploaded_file = st.file_uploader("Upload CSV (optional, otherwise machine_sensor_drift.csv is used)", type=["csv"])
 
 try:
     if uploaded_file is not None:
@@ -104,7 +104,7 @@ try:
         df_raw = pd.read_csv(DEFAULT_CSV_PATH)
         source_name = DEFAULT_CSV_PATH
     else:
-        st.warning("Upload a CSV file or add data.csv to the project.")
+        st.warning("Upload a CSV file or add machine_sensor_drift.csv to the project.")
         st.stop()
 except Exception as exc:
     st.error(f"Could not read the CSV file: {exc}")
