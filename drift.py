@@ -33,11 +33,6 @@ LEARNERS = [INCR, ONLINE, CONT, TRANS]
 PALETTE = ["#6366F1", "#06B6D4", "#F59E0B", "#10B981", "#EF4444", "#8B5CF6"]
 
 
-def load_default_df():
-    """Load the default dataset (drift.csv)."""
-    return pd.read_csv(DEFAULT_CSV_PATH)
-
-
 def style_fig(fig, height=420):
     fig.update_layout(
         template="plotly_white", height=height, colorway=PALETTE,
@@ -257,7 +252,7 @@ def run_experiment(df, num_cols, cat_cols, target, cfg, progress):
         for i, err in enumerate(errors):
             adwin.update(float(err))
             if adwin.drift_detected:
-                adwin_events.append({"row": s + i, "window": w})
+                adwin_events.append({"row": s + i})
                 flagged = True
         if flagged:
             flagged_windows.append(w)
@@ -301,17 +296,9 @@ def run_experiment(df, num_cols, cat_cols, target, cfg, progress):
 
     # --- summaries ---
     first_w = flagged_windows[0] if flagged_windows else None
-    res = {"cfg": cfg, "task": "regression", "n_ref": n_ref, "windows": windows, "adwin_events": adwin_events,
-           "flagged_windows": flagged_windows, "active_windows": active_windows, "first_flag_window": first_w,
-           "metrics": pd.DataFrame(metric_rows), "primary": "mae", "higher_better": False}
-
-    onset = cfg["onset"]
-    res["delays"] = None
-    if onset > 0:
-        a_rows = [ev["row"] for ev in adwin_events]
-        after = [r for r in a_rows if r >= onset]
-        res["delays"] = {"ADWIN delay (rows)": (after[0] - onset) if after else None,
-                         "False alarms before onset": sum(r < onset for r in a_rows)}
+    res = {"cfg": cfg, "n_ref": n_ref, "windows": windows, "adwin_events": adwin_events,
+           "active_windows": active_windows, "first_flag_window": first_w,
+           "metrics": pd.DataFrame(metric_rows)}
 
     stream_end = windows[-1][1]
     y_stream_true = y_true_all[n_ref:stream_end]
