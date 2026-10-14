@@ -16,48 +16,20 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
 
 
-DEFAULT_CSV_PATH = "data.csv"
-
-
-TARGET_COL = None       # None -> last column of the CSV; or put a fixed column name here
-
-
-REF_PCT = 30            # FIXED size of the training (reference) data, in % of rows
-
-
+DEFAULT_CSV_PATH = "machine_sensor_drift.csv"
+TARGET_COL = None      
+REF_PCT = 30           
 MAX_CAT_UNIQUE = 50
-
-
 TARGET_CAP = 2000
-
-
 TRANSFER_EPOCHS = 3
-
-
 SEED = 42
-
-
 STATIC = "Static (no adaptation)"
-
-
 INCR = "Incremental"
-
-
 ONLINE = "Online"
-
-
 CONT = "Continual"
-
-
 TRANS = "Transfer"
-
-
 SCRATCH = "Scratch (target-only baseline)"
-
-
 LEARNERS = [INCR, ONLINE, CONT, TRANS]
-
-
 PALETTE = ["#6366F1", "#06B6D4", "#F59E0B", "#10B981", "#EF4444", "#8B5CF6"]
 
 
