@@ -347,7 +347,5 @@ def timeline_fig(res):
                                  mode="markers", name="ADWIN drift event",
                                  marker=dict(symbol="triangle-up", color="#EF4444", size=12)))
     fig.add_vline(x=res["n_ref"], line_dash="dot", line_color="gray", annotation_text="end of reference")
-    if res["cfg"]["onset"] > 0:
-        fig.add_vline(x=res["cfg"]["onset"], line_dash="dash", line_color="#10B981", annotation_text="known onset")
     fig.update_layout(xaxis_title="Row index", yaxis_title="MAE")
     return style_fig(fig, 420)
