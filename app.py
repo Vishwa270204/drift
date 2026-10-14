@@ -11,7 +11,7 @@ import streamlit as st
 
 from drift import (
     CONT, DEFAULT_CSV_PATH, INCR, LEARNERS, ONLINE, PALETTE, REF_PCT,
-    SCRATCH, STATIC, TARGET_COL, TRANS, detect_task, prepare_df, run_experiment,
+    SCRATCH, STATIC, TARGET_COL, TRANS, prepare_df, run_experiment,
     split_columns, style_fig, timeline_fig,
 )
 
