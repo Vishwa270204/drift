@@ -257,6 +257,19 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
         filled, seen = reservoir_add(Xb, yb, filled, seen, X_all[:n_ref], y_all[:n_ref], rng)
     Xt, yt = np.zeros((0, d)), np.zeros(0, dtype=y_all.dtype)
 
+    # Select adaptation data only from the reference period and rows already observed.
+    # The default preserves the historical + current-window behavior for batch learners.
+    retrain_data = cfg.get("retrain_data", "old_new")
+    X_ref, y_ref = X_all[:n_ref], y_all[:n_ref]
+
+    def adaptation_data(X_new, y_new):
+        if retrain_data == "old":
+            return X_ref, y_ref
+        if retrain_data == "new":
+            return X_new, y_new
+        # old_new (default): retain the original reference examples and add current data.
+        return np.vstack([X_ref, X_new]), np.concatenate([y_ref, y_new])
+
     def predict(name, X):
         m = models[name]
         return (base if m is None else m).predict(X)
@@ -316,35 +329,44 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
 
         # 3) ADAPT (only while adaptation is active)
         if CONT in models:
-            if active and filled > 0:
-                k = min(len(yw), filled)
-                idx = rng.choice(filled, size=k, replace=False)
+            if active:
+                if retrain_data == "old":
+                    X_cont, y_cont = X_ref, y_ref
+                elif retrain_data == "new" or filled == 0:
+                    X_cont, y_cont = Xw, yw
+                else:
+                    # Preserve Continual's replay-buffer behavior for the combined option.
+                    k = min(len(yw), filled)
+                    idx = rng.choice(filled, size=k, replace=False)
+                    X_cont = np.vstack([Xw, Xb[idx]])
+                    y_cont = np.concatenate([yw, yb[idx]])
                 t0 = time.perf_counter()
-                fit_epochs(models[CONT], np.vstack([Xw, Xb[idx]]), np.concatenate([yw, yb[idx]]),
-                           task, classes, rng=rng)
+                fit_epochs(models[CONT], X_cont, y_cont, task, classes, rng=rng)
                 upd_time[CONT] += time.perf_counter() - t0
                 upd_count[CONT] += 1
             filled, seen = reservoir_add(Xb, yb, filled, seen, Xw, yw, rng)
         if INCR in models and active:
+            X_adapt, y_adapt = adaptation_data(Xw, yw)
             t0 = time.perf_counter()
-            fit_epochs(models[INCR], Xw, yw, task, classes, rng=rng)
+            fit_epochs(models[INCR], X_adapt, y_adapt, task, classes, rng=rng)
             upd_time[INCR] += time.perf_counter() - t0
             upd_count[INCR] += 1
         if TRANS in models:
             Xt, yt = np.vstack([Xt, Xw])[-TARGET_CAP:], np.concatenate([yt, yw])[-TARGET_CAP:]
             if active:
+                X_adapt, y_adapt = adaptation_data(Xt, yt)
                 t0 = time.perf_counter()
                 tm = copy.deepcopy(base)
-                fit_epochs(tm, Xt, yt, task, classes, epochs=TRANSFER_EPOCHS, rng=rng)
+                fit_epochs(tm, X_adapt, y_adapt, task, classes, epochs=TRANSFER_EPOCHS, rng=rng)
                 upd_time[TRANS] += time.perf_counter() - t0
                 models[TRANS] = tm
                 upd_count[TRANS] += 1
+                # Keep Scratch as the target-only comparison baseline, independent of selector.
                 t0 = time.perf_counter()
                 sm = make_model(task)
                 fit_epochs(sm, Xt, yt, task, classes, epochs=TRANSFER_EPOCHS, rng=rng)
                 upd_time[SCRATCH] += time.perf_counter() - t0
                 models[SCRATCH] = sm
-                upd_count[SCRATCH] += 1
 
         # 4) adaptation switch for the NEXT windows
         if active:
