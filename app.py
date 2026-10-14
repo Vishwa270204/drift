@@ -239,7 +239,8 @@ with tab_b:
     line.add_vline(x=res["n_ref"], line_dash="dot", line_color="gray")
     for i, ev in enumerate(res["adwin_events"]):
         line.add_vline(x=ev["row"], line_dash="dash", line_color="#EF4444", opacity=0.9 if i == 0 else 0.35,
-                       annotation_text="first drift signal" if i == 0 else None)
+                       annotation_text=f"drift {i + 1}", annotation_position="top",
+                       annotation_textangle=-90, annotation_font_size=10)
     st.plotly_chart(style_fig(line, 420), use_container_width=True)
 
     c1, c2 = st.columns(2)
