@@ -1,4 +1,4 @@
-"""Core logic and plotting helpers for the Model Drift Detection Dashboard."""
+"""Core logic and plotting helpers for the Model Drift Detection Dashboard (regression only)."""
 
 import copy
 import time
@@ -10,15 +10,15 @@ import plotly.graph_objects as go
 from river.drift import ADWIN
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import SGDClassifier, SGDRegressor
-from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error
+from sklearn.linear_model import SGDRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
 DEFAULT_CSV_PATH = "drift.csv"
-TARGET_COL = None      
-REF_PCT = 30           
+TARGET_COL = None
+REF_PCT = 30
 MAX_CAT_UNIQUE = 50
 TARGET_CAP = 2000
 TRANSFER_EPOCHS = 3
@@ -31,6 +31,11 @@ TRANS = "Transfer"
 SCRATCH = "Scratch (target-only baseline)"
 LEARNERS = [INCR, ONLINE, CONT, TRANS]
 PALETTE = ["#6366F1", "#06B6D4", "#F59E0B", "#10B981", "#EF4444", "#8B5CF6"]
+
+
+def load_default_df():
+    """Load the default dataset (drift.csv)."""
+    return pd.read_csv(DEFAULT_CSV_PATH)
 
 
 def style_fig(fig, height=420):
@@ -46,6 +51,8 @@ def style_fig(fig, height=420):
 
 
 def prepare_df(df_raw, target, time_col):
+    if not pd.api.types.is_numeric_dtype(df_raw[target]) or pd.api.types.is_bool_dtype(df_raw[target]):
+        raise ValueError(f"Target '{target}' must be a numeric column (this dashboard supports regression only).")
     df = df_raw.replace([np.inf, -np.inf], np.nan).dropna(subset=[target])
     if time_col is not None:
         key = df[time_col]
@@ -87,16 +94,6 @@ def split_columns(df, target, time_col):
     return num_cols, cat_cols, pd.DataFrame(roles, columns=["column", "dtype", "role", "note"])
 
 
-def detect_task(y):
-    """Classification for text/bool targets and integer-valued targets with <= 10 values."""
-    y = y.dropna()
-    if not pd.api.types.is_numeric_dtype(y) or pd.api.types.is_bool_dtype(y):
-        return "classification"
-    if y.nunique() <= 10 and bool((y % 1 == 0).all()):
-        return "classification"
-    return "regression"
-
-
 def feature_frame(df, num_cols, cat_cols):
     X = df[num_cols + cat_cols].copy()
     for c in cat_cols:
@@ -105,28 +102,18 @@ def feature_frame(df, num_cols, cat_cols):
     return X
 
 
-def make_model(task):
-    if task == "classification":
-        return SGDClassifier(loss="log_loss", alpha=1e-4, random_state=SEED)
+def make_model():
     return SGDRegressor(alpha=1e-4, random_state=SEED)
 
 
-def fit_epochs(model, X, y, task, classes, epochs=1, rng=None):
+def fit_epochs(model, X, y, epochs=1, rng=None):
     rng = rng if rng is not None else np.random.default_rng(SEED)
     for _ in range(epochs):
         order = rng.permutation(len(y))
-        if task == "classification":
-            model.partial_fit(X[order], y[order], classes=classes)
-        else:
-            model.partial_fit(X[order], y[order])
+        model.partial_fit(X[order], y[order])
 
 
-def score(task, y_true, y_pred):
-    if task == "classification":
-        return {
-            "accuracy": accuracy_score(y_true, y_pred),
-            "f1": f1_score(y_true, y_pred, average="macro", zero_division=0),
-        }
+def score(y_true, y_pred):
     return {
         "mae": mean_absolute_error(y_true, y_pred),
         "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
@@ -156,14 +143,15 @@ def make_windows(n_ref, n, batch):
     return windows
 
 
-def recovery_text(scores, first_w, higher_better, tol=0.05):
+def recovery_text(scores, first_w, tol=0.05):
+    """Windows until MAE returns to within `tol` of its pre-drift level (lower is better)."""
     if first_w is None:
         return "n/a (no drift signal)"
     if first_w == 0:
         return "n/a (no pre-drift windows)"
     scores = np.asarray(scores, float)
     pre = scores[:first_w].mean()
-    ok = scores >= pre * (1 - tol) if higher_better else scores <= pre * (1 + tol)
+    ok = scores <= pre * (1 + tol)
     after = ok[first_w:]
     bad = np.where(~after)[0]
     if len(bad) == 0:
@@ -174,7 +162,7 @@ def recovery_text(scores, first_w, higher_better, tol=0.05):
     return f"{int(rest[0])} windows"
 
 
-def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
+def run_experiment(df, num_cols, cat_cols, target, cfg, progress):
     n = len(df)
     n_ref = int(n * REF_PCT / 100)
     if n_ref < 50:
@@ -196,25 +184,16 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
     pre = ColumnTransformer(steps).fit(X_df.iloc[:n_ref])
     X_all = np.asarray(pre.transform(X_df), dtype=float)
 
-    classes = None
-    if task == "classification":
-        le = LabelEncoder().fit(df[target].astype(str))
-        y_all = le.transform(df[target].astype(str))
-        classes = np.arange(len(le.classes_))
-        y_true_all = y_all
-        mu, sd = 0.0, 1.0
-        if len(np.unique(y_all[:n_ref])) < 2:
-            raise ValueError("The reference period contains a single class. Use a different dataset.")
-    else:
-        y_raw = df[target].astype(float).to_numpy()
-        mu = float(y_raw[:n_ref].mean())
-        sd = float(y_raw[:n_ref].std()) or 1.0
-        y_all = (y_raw - mu) / sd
-        y_true_all = y_raw
+    # --- target is standardised with reference-period statistics ---
+    y_raw = df[target].astype(float).to_numpy()
+    mu = float(y_raw[:n_ref].mean())
+    sd = float(y_raw[:n_ref].std()) or 1.0
+    y_all = (y_raw - mu) / sd
+    y_true_all = y_raw
 
     # --- one source model, trained on the reference period ---
-    base = make_model(task)
-    fit_epochs(base, X_all[:n_ref], y_all[:n_ref], task, classes, epochs=10, rng=rng)
+    base = make_model()
+    fit_epochs(base, X_all[:n_ref], y_all[:n_ref], epochs=10, rng=rng)
     models = {STATIC: base}
     for name in cfg["strategies"]:
         models[name] = copy.deepcopy(base)
@@ -234,7 +213,7 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
         return (base if m is None else m).predict(X)
 
     def to_orig(p):
-        return p if task == "classification" else p * sd + mu
+        return p * sd + mu
 
     # --- state ---
     adwin = ADWIN(delta=cfg["adwin_delta"])
@@ -260,7 +239,7 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
                     xi = Xw[i:i + 1]
                     out.append(models[ONLINE].predict(xi)[0])
                     t0 = time.perf_counter()
-                    fit_epochs(models[ONLINE], xi, yw[i:i + 1], task, classes, rng=rng)
+                    fit_epochs(models[ONLINE], xi, yw[i:i + 1], rng=rng)
                     t_up += time.perf_counter() - t0
                 raw[name] = np.array(out)
                 upd_time[ONLINE] += t_up
@@ -270,13 +249,10 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
         for name, p in raw.items():
             preds_store[name].append(p)
             metric_rows.append({"strategy": name, "window": w, "start": s, "end": e,
-                                **score(task, y_true_all[s:e], to_orig(p))})
+                                **score(y_true_all[s:e], to_orig(p))})
 
-        # 2) DETECT: ADWIN on the errors of the never-updated static model
-        if task == "classification":
-            errors = (raw[STATIC] != yw).astype(float)
-        else:
-            errors = np.clip(np.abs(raw[STATIC] - yw), 0, 5)
+        # 2) DETECT: ADWIN on the (clipped) errors of the never-updated static model
+        errors = np.clip(np.abs(raw[STATIC] - yw), 0, 5)
         flagged = False
         for i, err in enumerate(errors):
             adwin.update(float(err))
@@ -292,14 +268,13 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
                 k = min(len(yw), filled)
                 idx = rng.choice(filled, size=k, replace=False)
                 t0 = time.perf_counter()
-                fit_epochs(models[CONT], np.vstack([Xw, Xb[idx]]), np.concatenate([yw, yb[idx]]),
-                           task, classes, rng=rng)
+                fit_epochs(models[CONT], np.vstack([Xw, Xb[idx]]), np.concatenate([yw, yb[idx]]), rng=rng)
                 upd_time[CONT] += time.perf_counter() - t0
                 upd_count[CONT] += 1
             filled, seen = reservoir_add(Xb, yb, filled, seen, Xw, yw, rng)
         if INCR in models and active:
             t0 = time.perf_counter()
-            fit_epochs(models[INCR], Xw, yw, task, classes, rng=rng)
+            fit_epochs(models[INCR], Xw, yw, rng=rng)
             upd_time[INCR] += time.perf_counter() - t0
             upd_count[INCR] += 1
         if TRANS in models:
@@ -307,13 +282,13 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
             if active:
                 t0 = time.perf_counter()
                 tm = copy.deepcopy(base)
-                fit_epochs(tm, Xt, yt, task, classes, epochs=TRANSFER_EPOCHS, rng=rng)
+                fit_epochs(tm, Xt, yt, epochs=TRANSFER_EPOCHS, rng=rng)
                 upd_time[TRANS] += time.perf_counter() - t0
                 models[TRANS] = tm
                 upd_count[TRANS] += 1
                 t0 = time.perf_counter()
-                sm = make_model(task)
-                fit_epochs(sm, Xt, yt, task, classes, epochs=TRANSFER_EPOCHS, rng=rng)
+                sm = make_model()
+                fit_epochs(sm, Xt, yt, epochs=TRANSFER_EPOCHS, rng=rng)
                 upd_time[SCRATCH] += time.perf_counter() - t0
                 models[SCRATCH] = sm
                 upd_count[SCRATCH] += 1
@@ -325,12 +300,10 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
             remaining = cfg["adapt_windows"]
 
     # --- summaries ---
-    higher = task == "classification"
-    prim = "f1" if higher else "mae"
     first_w = flagged_windows[0] if flagged_windows else None
-    res = {"cfg": cfg, "task": task, "n_ref": n_ref, "windows": windows, "adwin_events": adwin_events,
+    res = {"cfg": cfg, "task": "regression", "n_ref": n_ref, "windows": windows, "adwin_events": adwin_events,
            "flagged_windows": flagged_windows, "active_windows": active_windows, "first_flag_window": first_w,
-           "metrics": pd.DataFrame(metric_rows), "primary": prim, "higher_better": higher}
+           "metrics": pd.DataFrame(metric_rows), "primary": "mae", "higher_better": False}
 
     onset = cfg["onset"]
     res["delays"] = None
@@ -351,37 +324,33 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
     rows, rank = [], {}
     for name in models:
         p = to_orig(np.concatenate(preds_store[name]))
-        overall = score(task, y_stream_true, p)
-        post = score(task, y_stream_true[post_mask], p[post_mask]) if post_mask is not None else None
-        series = mdf[mdf.strategy == name].sort_values("window")[prim].to_numpy()
-        row = {"Strategy": name}
-        if task == "classification":
-            row.update({"Accuracy": overall["accuracy"], "F1 (macro)": overall["f1"],
-                        "Post-drift F1": post["f1"] if post else np.nan})
-        else:
-            row.update({"MAE": overall["mae"], "RMSE": overall["rmse"],
-                        "Post-drift MAE": post["mae"] if post else np.nan})
-        row.update({"Recovery": recovery_text(series, first_w, higher),
-                    "Updates": upd_count[name],
-                    "Update time (s)": upd_time[name]})
-        rows.append(row)
-        rank[name] = post[prim] if post else overall[prim]
+        overall = score(y_stream_true, p)
+        post = score(y_stream_true[post_mask], p[post_mask]) if post_mask is not None else None
+        series = mdf[mdf.strategy == name].sort_values("window")["mae"].to_numpy()
+        rows.append({
+            "Strategy": name,
+            "MAE": overall["mae"],
+            "RMSE": overall["rmse"],
+            "Post-drift MAE": post["mae"] if post else np.nan,
+            "Recovery": recovery_text(series, first_w),
+            "Updates": upd_count[name],
+            "Update time (s)": upd_time[name],
+        })
+        rank[name] = post["mae"] if post else overall["mae"]
     res["summary"], res["rank_basis"] = pd.DataFrame(rows), rank
     res["rank_uses_post_drift"] = post_mask is not None
     cands = [s_ for s_ in cfg["strategies"] if s_ in rank]
-    res["best"] = max(cands, key=lambda k: rank[k]) if higher else min(cands, key=lambda k: rank[k])
+    res["best"] = min(cands, key=lambda k: rank[k])
     return res
 
 
 def timeline_fig(res):
     windows = res["windows"]
     mid = [(s + e) / 2 for s, e in windows]
-    prim = res["primary"]
-    ylabel = "F1 (macro)" if prim == "f1" else "MAE"
     sdf = res["metrics"][res["metrics"].strategy == STATIC].sort_values("window")
-    y = sdf[prim].to_numpy()
+    y = sdf["mae"].to_numpy()
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=mid, y=y, mode="lines+markers", name=f"Static model {ylabel}",
+    fig.add_trace(go.Scatter(x=mid, y=y, mode="lines+markers", name="Static model MAE",
                              line=dict(width=3, color=PALETTE[0]), marker=dict(size=7),
                              fill="tozeroy", fillcolor="rgba(99,102,241,.08)"))
     lo, hi = float(np.min(y)), float(np.max(y))
@@ -393,7 +362,5 @@ def timeline_fig(res):
     fig.add_vline(x=res["n_ref"], line_dash="dot", line_color="gray", annotation_text="end of reference")
     if res["cfg"]["onset"] > 0:
         fig.add_vline(x=res["cfg"]["onset"], line_dash="dash", line_color="#10B981", annotation_text="known onset")
-    fig.update_layout(xaxis_title="Row index", yaxis_title=ylabel)
+    fig.update_layout(xaxis_title="Row index", yaxis_title="MAE")
     return style_fig(fig, 420)
-
-
