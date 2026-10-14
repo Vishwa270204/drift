@@ -284,6 +284,7 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
     upd_time = {name: 0.0 for name in models}
     upd_count = {name: 0 for name in models}
     remaining = 0  # windows of adaptation left (only set by an ADWIN drift signal)
+    adaptation_log = []  # auditable record of actual retraining data per strategy/window
 
     for w, (s, e) in enumerate(windows):
         progress((w + 1) / len(windows), f"Window {w + 1} / {len(windows)}")
@@ -342,6 +343,9 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
                     y_cont = np.concatenate([yw, yb[idx]])
                 t0 = time.perf_counter()
                 fit_epochs(models[CONT], X_cont, y_cont, task, classes, rng=rng)
+                adaptation_log.append({"window": w, "strategy": CONT, "data_strategy": retrain_data,
+                                       "old_rows": len(X_ref) if retrain_data in ("old", "old_new") else 0,
+                                       "new_rows": len(Xw) if retrain_data != "old" else 0, "training_rows": len(X_cont)})
                 upd_time[CONT] += time.perf_counter() - t0
                 upd_count[CONT] += 1
             filled, seen = reservoir_add(Xb, yb, filled, seen, Xw, yw, rng)
@@ -349,6 +353,9 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
             X_adapt, y_adapt = adaptation_data(Xw, yw)
             t0 = time.perf_counter()
             fit_epochs(models[INCR], X_adapt, y_adapt, task, classes, rng=rng)
+            adaptation_log.append({"window": w, "strategy": INCR, "data_strategy": retrain_data,
+                                   "old_rows": len(X_ref) if retrain_data in ("old", "old_new") else 0,
+                                   "new_rows": len(Xw) if retrain_data != "old" else 0, "training_rows": len(X_adapt)})
             upd_time[INCR] += time.perf_counter() - t0
             upd_count[INCR] += 1
         if TRANS in models:
@@ -358,6 +365,9 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
                 t0 = time.perf_counter()
                 tm = copy.deepcopy(base)
                 fit_epochs(tm, X_adapt, y_adapt, task, classes, epochs=TRANSFER_EPOCHS, rng=rng)
+                adaptation_log.append({"window": w, "strategy": TRANS, "data_strategy": retrain_data,
+                                       "old_rows": len(X_ref) if retrain_data in ("old", "old_new") else 0,
+                                       "new_rows": len(Xt) if retrain_data != "old" else 0, "training_rows": len(X_adapt)})
                 upd_time[TRANS] += time.perf_counter() - t0
                 models[TRANS] = tm
                 upd_count[TRANS] += 1
@@ -379,6 +389,7 @@ def run_experiment(df, num_cols, cat_cols, target, task, cfg, progress):
     prim = "f1" if higher else "mae"
     first_w = flagged_windows[0] if flagged_windows else None
     res = {"cfg": cfg, "task": task, "n_ref": n_ref, "windows": windows, "adwin_events": adwin_events,
+           "adaptation_log": adaptation_log,
            "flagged_windows": flagged_windows, "active_windows": active_windows, "first_flag_window": first_w,
            "metrics": pd.DataFrame(metric_rows), "primary": prim, "higher_better": higher}
 
