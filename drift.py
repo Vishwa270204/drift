@@ -16,7 +16,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
 
 
-DEFAULT_CSV_PATH = "machine_sensor_drift.csv"
+DEFAULT_CSV_PATH = "drift.csv"
 TARGET_COL = None      
 REF_PCT = 30           
 MAX_CAT_UNIQUE = 50
