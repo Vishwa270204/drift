@@ -73,7 +73,8 @@ div[data-testid="stMetricValue"] {font-weight: 750;}
 # ----------------------------------------------------------------------------
 # Load data (default CSV only)
 # ----------------------------------------------------------------------------
-HERO_TITLE = '''<h1>📉 Model Drift Detection Dashboard</h1>'''
+HERO_TITLE = '''<h1>📉 Model Drift Detection Dashboard</h1>
+  <p>ADWIN drift detection on prequential errors, with adaptation that starts only after a drift signal.</p>'''
 hero_ph = st.empty()
 hero_ph.markdown(f'<div class="hero">{HERO_TITLE}</div>', unsafe_allow_html=True)  # title first, chips added later
 
@@ -198,7 +199,6 @@ if res is None:
     st.stop()
 
 windows = res["windows"]
-first_w = res["first_flag_window"]
 prim = "mae"
 plabel = "MAE"
 
@@ -237,8 +237,9 @@ with tab_b:
     line = px.line(mdf, x="row", y="value", color="strategy", labels={"row": "Row index", "value": plabel})
     line.update_traces(line=dict(width=3))
     line.add_vline(x=res["n_ref"], line_dash="dot", line_color="gray")
-    if first_w is not None:
-        line.add_vline(x=windows[first_w][1], line_dash="dash", line_color="#EF4444", annotation_text="first drift signal")
+    for i, ev in enumerate(res["adwin_events"]):
+        line.add_vline(x=ev["row"], line_dash="dash", line_color="#EF4444", opacity=0.9 if i == 0 else 0.35,
+                       annotation_text="first drift signal" if i == 0 else None)
     st.plotly_chart(style_fig(line, 420), use_container_width=True)
 
     c1, c2 = st.columns(2)
