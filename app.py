@@ -1,4 +1,4 @@
-"""Streamlit UI for the Model Drift Detection Dashboard.
+"""Streamlit UI for the Model Drift Detection Dashboard (regression only, default CSV).
 
 Run with: streamlit run app.py
 """
@@ -15,28 +15,7 @@ from drift import (
     split_columns, style_fig, timeline_fig,
 )
 
-
-
-
-
-# ----------------------------------------------------------------------------
-# Constants
-# ----------------------------------------------------------------------------
-
-
-
 st.set_page_config(page_title="Model Drift Dashboard", page_icon="📉", layout="wide")
-
-st.markdown("""
-<style>
-    .block-container {
-        max-width: 100% !important;
-        padding-left: 2rem !important;
-        padding-right: 2rem !important;
-        padding-top: 1rem !important;
-    }
-</style>
-""", unsafe_allow_html=True)
 
 # ----------------------------------------------------------------------------
 # Styling
@@ -44,7 +23,12 @@ st.markdown("""
 st.markdown(
     """
 <style>
-.block-container {padding-top: 1.6rem; max-width: 1280px;}
+.block-container {
+    max-width: 100% !important;
+    padding-left: 2rem !important;
+    padding-right: 2rem !important;
+    padding-top: 1.6rem !important;
+}
 .hero {
     background: linear-gradient(120deg, #4F46E5 0%, #7C3AED 50%, #06B6D4 100%);
     padding: 1.8rem 2rem; border-radius: 18px; color: #fff; margin-bottom: 1.2rem;
@@ -87,27 +71,21 @@ div[data-testid="stMetricValue"] {font-weight: 750;}
 )
 
 # ----------------------------------------------------------------------------
-# Load data
+# Load data (default CSV only)
 # ----------------------------------------------------------------------------
 HERO_TITLE = '''<h1>📉 Model Drift Detection Dashboard</h1>
   <p>ADWIN drift detection on prequential errors, with adaptation that starts only after a drift signal.</p>'''
 hero_ph = st.empty()
 hero_ph.markdown(f'<div class="hero">{HERO_TITLE}</div>', unsafe_allow_html=True)  # title first, chips added later
 
-uploaded_file = st.file_uploader("Upload CSV (optional, otherwise machine_sensor_drift.csv is used)", type=["csv"])
-
+source_name = DEFAULT_CSV_PATH
+if not os.path.exists(DEFAULT_CSV_PATH):
+    st.warning(f"Add {DEFAULT_CSV_PATH} to the project folder.")
+    st.stop()
 try:
-    if uploaded_file is not None:
-        df_raw = pd.read_csv(uploaded_file)
-        source_name = uploaded_file.name
-    elif os.path.exists(DEFAULT_CSV_PATH):
-        df_raw = pd.read_csv(DEFAULT_CSV_PATH)
-        source_name = DEFAULT_CSV_PATH
-    else:
-        st.warning("Upload a CSV file or add machine_sensor_drift.csv to the project.")
-        st.stop()
+    df_raw = pd.read_csv(DEFAULT_CSV_PATH)
 except Exception as exc:
-    st.error(f"Could not read the CSV file: {exc}")
+    st.error(f"Could not read {DEFAULT_CSV_PATH}: {exc}")
     st.stop()
 
 if df_raw.shape[0] < 100 or df_raw.shape[1] < 2:
@@ -116,7 +94,7 @@ if df_raw.shape[0] < 100 or df_raw.shape[1] < 2:
 df_raw.columns = [str(c) for c in df_raw.columns]
 
 # ----------------------------------------------------------------------------
-# Fixed target + automatic task
+# Fixed target (regression)
 # ----------------------------------------------------------------------------
 cols = list(df_raw.columns)
 target = TARGET_COL if TARGET_COL in cols else cols[-1]
@@ -143,17 +121,15 @@ time_col = None if order_choice == "(keep file order)" else order_choice
 # ----------------------------------------------------------------------------
 # Dataset preparation
 # ----------------------------------------------------------------------------
-df = prepare_df(df_raw, target, time_col)
+try:
+    df = prepare_df(df_raw, target, time_col)
+except ValueError as exc:
+    st.error(str(exc))
+    st.stop()
 num_cols, cat_cols, roles = split_columns(df, target, time_col)
 if len(num_cols) + len(cat_cols) == 0:
     st.error("No usable feature columns were found after excluding the target and invalid columns.")
     st.stop()
-
-task = detect_task(df[target])
-if task == "classification" and df[target].nunique() > 50:
-    st.error("The target (last column) has more than 50 distinct values for classification. Use a different dataset.")
-    st.stop()
-model_name = "SGDClassifier" if task == "classification" else "SGDRegressor"
 
 # ----------------------------------------------------------------------------
 # Hero header
@@ -163,7 +139,7 @@ hero_ph.markdown(
 <div class="hero">
   {HERO_TITLE}
   <span class="chip">🎯 Target: {target}</span>
-  <span class="chip">🤖 {task.capitalize()} · {model_name}</span>
+  <span class="chip">🤖 Regression · SGDRegressor</span>
   <span class="chip">📚 Training data: first {REF_PCT}% of rows</span>
   <span class="chip">⚡ Adapt after drift only</span>
 </div>
@@ -178,7 +154,7 @@ run_clicked = st.button("▶ Run Analysis", type="primary")
 # ----------------------------------------------------------------------------
 cfg = {"strategies": strategies, "batch": batch, "adwin_delta": float(adwin_delta),
        "adapt_windows": adapt_windows, "buffer": buffer_size, "onset": int(onset)}
-cfg_key = repr((source_name, target, time_col, task, sorted(cfg.items(), key=lambda kv: kv[0])))
+cfg_key = repr((source_name, target, time_col, sorted(cfg.items(), key=lambda kv: kv[0])))
 
 if run_clicked:
     if not strategies:
@@ -188,7 +164,7 @@ if run_clicked:
         try:
             with st.spinner("Running ADWIN and the learning strategies..."):
                 st.session_state["result"] = run_experiment(
-                    df, num_cols, cat_cols, target, task, cfg, lambda f, t: bar.progress(f, text=t))
+                    df, num_cols, cat_cols, target, cfg, lambda f, t: bar.progress(f, text=t))
             st.session_state["result_key"] = cfg_key
         except ValueError as exc:
             st.session_state.pop("result", None)
@@ -210,8 +186,7 @@ if res is not None:
     k3.metric("🚨 Drift events (ADWIN)", len(res["adwin_events"]))
     mdf = res["metrics"]
     latest = mdf[(mdf.strategy == res["best"]) & (mdf.window == mdf.window.max())].iloc[0]
-    label = "F1 (macro)" if res["primary"] == "f1" else "MAE"
-    k4.metric(f"🏁 Latest window {label}", f"{latest[res['primary']]:.3f}", help=f"Best strategy: {res['best']}")
+    k4.metric("🏁 Latest window MAE", f"{latest['mae']:.3f}", help=f"Best strategy: {res['best']}")
 else:
     k3.metric("🚨 Drift events (ADWIN)", "-", help="Press Run Analysis.")
     k4.metric("🏁 Latest model metric", "-", help="Press Run Analysis.")
@@ -228,8 +203,8 @@ if res is None:
 
 windows = res["windows"]
 first_w = res["first_flag_window"]
-prim, higher = res["primary"], res["higher_better"]
-plabel = "F1 (macro)" if prim == "f1" else "MAE"
+prim = "mae"
+plabel = "MAE"
 
 st.markdown(f'<div class="best-badge">🏆 Best strategy: {res["best"]}</div>', unsafe_allow_html=True)
 
@@ -242,8 +217,8 @@ with tab_a:
     st.caption(f"Reference: rows 0-{res['n_ref'] - 1}. Stream: {len(windows)} windows of about "
                f"{res['cfg']['batch']} rows. Adaptation was active in {len(res['active_windows'])} of {len(windows)} windows.")
     st.markdown('<div class="section-note">ADWIN watches the prequential error stream of the never-updated static model '
-                '(0/1 errors for classification, clipped standardised absolute error for regression). It signals that the '
-                'monitored signal changed. It cannot say which input feature caused the change.</div>',
+                '(clipped standardised absolute error). It signals that the monitored signal changed. '
+                'It cannot say which input feature caused the change.</div>',
                 unsafe_allow_html=True)
     st.plotly_chart(timeline_fig(res), use_container_width=True)
     if res["adwin_events"]:
@@ -263,11 +238,9 @@ with tab_a:
 with tab_b:
     summary = res["summary"]
     st.caption("Metrics are pooled over all stream rows. 'Post-drift' uses rows after the first window with an ADWIN event. "
-               "'Recovery' counts windows from the first degraded window until the metric is within 5% of its "
+               "'Recovery' counts windows from the first degraded window until MAE is within 5% of its "
                "pre-drift level. All models predict before they are updated.")
-    st.dataframe(summary.style.format({c: "{:.4f}" for c in summary.columns
-                                       if c in ("Accuracy", "F1 (macro)", "Post-drift F1", "MAE", "RMSE",
-                                                "Post-drift MAE", "Update time (s)")}),
+    st.dataframe(summary.style.format({c: "{:.4f}" for c in ("MAE", "RMSE", "Post-drift MAE", "Update time (s)")}),
                  use_container_width=True, hide_index=True)
 
     smooth = st.checkbox("Smooth with a 3-window rolling mean", value=True)
