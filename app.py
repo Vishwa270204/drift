@@ -221,16 +221,6 @@ with tab_a:
                 'It cannot say which input feature caused the change.</div>',
                 unsafe_allow_html=True)
     st.plotly_chart(timeline_fig(res), use_container_width=True)
-    if res["adwin_events"]:
-        ev = pd.DataFrame(res["adwin_events"]).rename(columns={"row": "stream row index", "window": "window #"})
-        st.dataframe(ev, use_container_width=True, hide_index=True, height=min(250, 40 + 35 * len(ev)))
-    else:
-        st.success("No ADWIN drift events were detected.")
-    if res["delays"] is not None:
-        st.subheader("Detection delay (known onset)")
-        cols_d = st.columns(len(res["delays"]))
-        for c_, (k_, v_) in zip(cols_d, res["delays"].items()):
-            c_.metric(k_, "not detected" if v_ is None else v_)
 
 # ----------------------------------------------------------------------------
 # B. Learning strategy comparison
