@@ -112,10 +112,7 @@ with st.expander("⚙️ Settings", expanded=True):
     b1, b2 = st.columns(2)
     adapt_windows = b1.slider("Windows to adapt after a drift signal (k)", 1, 10, 3)
     buffer_size = b2.slider("Continual replay buffer size", 100, 5000, 500, step=100)
-    d1, d2 = st.columns(2)
-    strategies = d1.multiselect("Learning strategies", LEARNERS, default=LEARNERS)
-    onset = d2.number_input("Known drift onset row (0 = unknown)", min_value=0, max_value=int(len(df_raw)),
-                            value=0, step=100, help="Optional. Enables detection-delay and false-alarm counts.")
+    strategies = st.multiselect("Learning strategies", LEARNERS, default=LEARNERS)
 time_col = None if order_choice == "(keep file order)" else order_choice
 
 # ----------------------------------------------------------------------------
@@ -153,7 +150,7 @@ run_clicked = st.button("▶ Run Analysis", type="primary")
 # Run
 # ----------------------------------------------------------------------------
 cfg = {"strategies": strategies, "batch": batch, "adwin_delta": float(adwin_delta),
-       "adapt_windows": adapt_windows, "buffer": buffer_size, "onset": int(onset)}
+       "adapt_windows": adapt_windows, "buffer": buffer_size}
 cfg_key = repr((source_name, target, time_col, sorted(cfg.items(), key=lambda kv: kv[0])))
 
 if run_clicked:
