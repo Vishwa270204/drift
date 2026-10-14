@@ -27,6 +27,17 @@ from drift import (
 
 st.set_page_config(page_title="Model Drift Dashboard", page_icon="📉", layout="wide")
 
+st.markdown("""
+<style>
+    .block-container {
+        max-width: 100% !important;
+        padding-left: 2rem !important;
+        padding-right: 2rem !important;
+        padding-top: 1rem !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # ----------------------------------------------------------------------------
 # Styling
 # ----------------------------------------------------------------------------
@@ -74,45 +85,6 @@ div[data-testid="stMetricValue"] {font-weight: 750;}
 """,
     unsafe_allow_html=True,
 )
-
-
-
-
-# ----------------------------------------------------------------------------
-# Data preparation
-# ----------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-# ----------------------------------------------------------------------------
-# Models and metrics
-# ----------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-# ----------------------------------------------------------------------------
-# The experiment
-# ----------------------------------------------------------------------------
-
-
-# ----------------------------------------------------------------------------
-# Plot helpers
-# ----------------------------------------------------------------------------
-
 
 # ----------------------------------------------------------------------------
 # Load data
@@ -166,16 +138,6 @@ with st.expander("⚙️ Settings", expanded=True):
     strategies = d1.multiselect("Learning strategies", LEARNERS, default=LEARNERS)
     onset = d2.number_input("Known drift onset row (0 = unknown)", min_value=0, max_value=int(len(df_raw)),
                             value=0, step=100, help="Optional. Enables detection-delay and false-alarm counts.")
-    retrain_data_label = st.selectbox(
-        "Retraining data strategy",
-        ["Old + New data", "New data only", "Old data only"],
-        index=0,
-        help=("Controls data used by batch adaptation after ADWIN signals drift. "
-              "Old = original reference/training period; New = currently observed window. "
-              "Static remains unchanged; Online continues learning prequentially from arriving rows; "
-              "the Scratch baseline remains new-data-only by design."),
-    )
-    retrain_data = {"Old data only": "old", "New data only": "new", "Old + New data": "old_new"}[retrain_data_label]
 time_col = None if order_choice == "(keep file order)" else order_choice
 
 # ----------------------------------------------------------------------------
@@ -215,8 +177,7 @@ run_clicked = st.button("▶ Run Analysis", type="primary")
 # Run
 # ----------------------------------------------------------------------------
 cfg = {"strategies": strategies, "batch": batch, "adwin_delta": float(adwin_delta),
-       "adapt_windows": adapt_windows, "buffer": buffer_size, "onset": int(onset),
-       "retrain_data": retrain_data}
+       "adapt_windows": adapt_windows, "buffer": buffer_size, "onset": int(onset)}
 cfg_key = repr((source_name, target, time_col, task, sorted(cfg.items(), key=lambda kv: kv[0])))
 
 if run_clicked:
