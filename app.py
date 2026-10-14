@@ -73,8 +73,7 @@ div[data-testid="stMetricValue"] {font-weight: 750;}
 # ----------------------------------------------------------------------------
 # Load data (default CSV only)
 # ----------------------------------------------------------------------------
-HERO_TITLE = '''<h1>📉 Model Drift Detection Dashboard</h1>
-  <p>ADWIN drift detection on prequential errors, with adaptation that starts only after a drift signal.</p>'''
+HERO_TITLE = '''<h1>📉 Model Drift Detection Dashboard</h1>'''
 hero_ph = st.empty()
 hero_ph.markdown(f'<div class="hero">{HERO_TITLE}</div>', unsafe_allow_html=True)  # title first, chips added later
 
